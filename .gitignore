@@ -1,0 +1,67 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# PyInstaller
+*.manifest.bak
+warn-*.txt
+xref-*.html
+
+# Built binaries (build locally with build_exe.bat)
+*.exe
+!build_exe.bat
+!Launch_IDM_Resetter.bat
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.cursor/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+nul
+ehthumbs.db
+
+# App runtime data (user machine)
+history.json
+*.lock
+*.log
+*.bak
+*.reg
+
+# Local secrets / personal overlays
+.env
+.env.*
+*.local
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
