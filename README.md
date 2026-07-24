@@ -51,23 +51,29 @@ Run the app and open **Dashboard** for live IDM status cards and **Operations** 
 
 ## Quick start
 
-### Option A — one-file EXE (recommended)
+### Option A — download EXE from GitHub Releases (easiest)
 
-1. Build (once):
+Do **not** commit the `.exe` into git (it is ~50 MB and gitignored). Host it on **Releases** instead:
 
-   ```bat
-   build_exe.bat
-   ```
+1. Open your repo → **Releases** → latest tag (e.g. `v5.0.0`)
+2. Download **`IDM_Trial_Resetter_Pro.exe`**
+3. Double-click → approve **UAC** → use the app
 
-2. Run either:
+Optional: verify `SHA256.txt` from the same release.
 
-   - `IDM_Trial_Resetter_Pro.exe` (project root, after build copies it), or  
-   - `dist\IDM_Trial_Resetter_Pro.exe`, or  
-   - `Launch_IDM_Resetter.bat` (prefers the EXE)
+### Option B — build EXE locally
 
-3. Approve the **UAC** prompt. The EXE requests Administrator by design.
+```bat
+build_exe.bat
+```
 
-### Option B — from source
+Then run:
+
+- `dist\IDM_Trial_Resetter_Pro.exe`, or  
+- `IDM_Trial_Resetter_Pro.exe` (copy at project root), or  
+- `Launch_IDM_Resetter.bat`
+
+### Option C — from source
 
 ```bat
 pip install -r requirements.txt
@@ -134,6 +140,72 @@ Spec highlights (`IDM_Trial_Resetter_Pro.spec`):
 - `uac_admin=True` + custom `admin.manifest`  
 - Hidden import: `engine`  
 - Excludes bulk unused packages (tkinter, numpy, …)
+
+---
+
+## Publish the EXE with GitHub Releases
+
+**Best practice:** keep source in git; attach the EXE only to a **Release**. Users download from the Assets list — no bloated history.
+
+### 1) Push the repo once
+
+```bat
+cd C:\Users\GLH\Desktop\IDM_Trial_Resetter_Pro
+
+:: create empty repo on github.com (no README), then:
+git remote add origin https://github.com/YOUR_USER/IDM-Trial-Resetter-Pro.git
+git push -u origin main
+```
+
+Or with GitHub CLI:
+
+```bat
+winget install GitHub.cli
+gh auth login
+gh repo create IDM-Trial-Resetter-Pro --public --source=. --remote=origin --push
+```
+
+### 2A) Automatic release (recommended)
+
+This repo includes [`.github/workflows/build-release.yml`](.github/workflows/build-release.yml).
+
+**Tag a version → Actions builds the EXE → attaches it to the Release:**
+
+```bat
+git tag v5.0.0
+git push origin v5.0.0
+```
+
+Then open: `https://github.com/YOUR_USER/IDM-Trial-Resetter-Pro/releases`
+
+Assets will include:
+
+- `IDM_Trial_Resetter_Pro.exe`
+- `IDM_Trial_Resetter_Pro-windows-x64.exe`
+- `SHA256.txt`
+
+**Manual run without a tag:** GitHub → **Actions** → **Build & Release EXE** → **Run workflow**.
+
+### 2B) Upload your already-built local EXE
+
+If GitHub CLI is installed and `origin` is set:
+
+```bat
+scripts\make_release.bat v5.0.0
+```
+
+That script builds if needed, creates/pushes tag `v5.0.0`, and uploads `dist\*.exe` + `SHA256.txt`.
+
+### 2C) Web UI (no CLI)
+
+1. Build locally: `build_exe.bat`
+2. GitHub repo → **Releases** → **Draft a new release**
+3. Tag: `v5.0.0` (create on publish)
+4. Title: `IDM Trial Resetter Pro v5.0.0`
+5. Drag-drop `dist\IDM_Trial_Resetter_Pro.exe` (and optional `SHA256.txt`)
+6. **Publish release**
+
+Visitors use **Releases** → **Assets** → download EXE. Source stays in the Code tab.
 
 ---
 

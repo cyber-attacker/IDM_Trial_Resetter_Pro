@@ -1,0 +1,122 @@
+name: Build & Release EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Upload artifacts and create a GitHub Release"
+        type: boolean
+        default: true
+      version:
+        description: "Version tag for manual release (e.g. v5.0.0). Leave empty to use run id."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build one-file admin EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        shell: cmd
+        run: |
+          python -m PyInstaller --noconfirm --clean IDM_Trial_Resetter_Pro.spec
+
+      - name: Verify EXE + UAC manifest
+        shell: pwsh
+        run: |
+          $exe = "dist\IDM_Trial_Resetter_Pro.exe"
+          if (-not (Test-Path $exe)) { throw "EXE missing: $exe" }
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $exe))
+          $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+          if ($ascii -notmatch "requireAdministrator") {
+            throw "UAC requireAdministrator not found in EXE"
+          }
+          $size = (Get-Item $exe).Length
+          Write-Host "OK size=$size bytes UAC=requireAdministrator"
+
+      - name: Hash artifact
+        shell: pwsh
+        run: |
+          $exe = "dist\IDM_Trial_Resetter_Pro.exe"
+          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File -Encoding utf8 dist\SHA256.txt
+          Copy-Item $exe dist\IDM_Trial_Resetter_Pro-windows-x64.exe
+          Get-Content dist\SHA256.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IDM_Trial_Resetter_Pro-windows-x64
+          path: |
+            dist/IDM_Trial_Resetter_Pro.exe
+            dist/IDM_Trial_Resetter_Pro-windows-x64.exe
+            dist/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+          } elseif ("${{ inputs.version }}" -ne "") {
+            $tag = "${{ inputs.version }}"
+          } else {
+            $tag = "build-${{ github.run_number }}"
+          }
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          echo "Resolved tag: $tag"
+
+      - name: Create GitHub Release (tags or manual)
+        if: >
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: IDM Trial Resetter Pro ${{ steps.meta.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.meta.outputs.tag, 'build-') }}
+          generate_release_notes: true
+          files: |
+            dist/IDM_Trial_Resetter_Pro.exe
+            dist/IDM_Trial_Resetter_Pro-windows-x64.exe
+            dist/SHA256.txt
+          body: |
+            ## Downloads
+            | File | Description |
+            |------|-------------|
+            | `IDM_Trial_Resetter_Pro.exe` | One-file Windows x64 UI (requires UAC / Admin) |
+            | `IDM_Trial_Resetter_Pro-windows-x64.exe` | Same build, named for clarity |
+            | `SHA256.txt` | Checksum |
+
+            ### Run
+            1. Download `IDM_Trial_Resetter_Pro.exe`
+            2. Double-click → approve **User Account Control**
+            3. Use **Reset Trial** / **Freeze** from Operations
+
+            Built automatically by GitHub Actions from source.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
