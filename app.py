@@ -579,40 +579,51 @@ class MainWindow(QMainWindow):
     ACTIONS = {
         "reset": (
             "Reset Trial",
-            "Deep-clean trial markers (tvfrdt, radxcnt, ConfigTime, SpecialData, "
-            "bRmGUCfEx, vCOUFP) and CLSID keys — including ACL-locked ones.",
+            "Plain clean 30-day trial ONLY — deep-wipes every marker and tracker key "
+            "(even ACL-locked). No serial, no locks: the trial simply starts over and "
+            "counts down again.",
             T.GREEN,
         ),
         "freeze": (
             "Freeze Trial",
-            "Wipe trial state, seed missing CLSID keys and ACL-lock ALL of them — "
-            "IDM can never persist its clock again (fixes the expiry nag).",
+            "Perpetual trial, no registration — wipes state then ACL-locks ALL tracker "
+            "keys so IDM can never persist its clock. Trial stays day-1 forever.",
             T.ACCENT,
+        ),
+        "activate": (
+            "Activate  ★ use when expired",
+            "The one-click fix: reset → register with an IAS-format serial → lock every "
+            "tracker → block update servers. Registered IDM: no expiry, no nag.",
+            T.ORANGE,
+        ),
+        "deactivate": (
+            "Deactivate",
+            "Undo Activate — removes the serial, unfreezes trackers, removes the hosts "
+            "block and leaves a clean day-1 trial.",
+            T.PURPLE,
         ),
         "unfreeze": (
             "Unfreeze",
-            "Restore normal registry permissions on tracking keys.",
+            "Restore normal registry permissions on tracker keys (removes the freeze "
+            "lock only).",
             T.YELLOW,
-        ),
-        "activate": (
-            "Activate",
-            "Reset → lock CLSIDs → register with an IAS-format serial → block "
-            "phone-home servers → seed → re-lock. No nags, no expiry.",
-            T.ORANGE,
         ),
         "block_updates": (
             "Block Updates",
-            "Sinkhole Tonec / IDM domains in the system hosts file.",
+            "Sinkhole Tonec / IDM domains in hosts — stops serial revalidation and "
+            "silent self-updates (e.g. 6.43b10 → b12).",
             T.RED,
         ),
         "unblock_updates": (
             "Unblock Updates",
-            "Remove hosts block section and flush DNS cache.",
+            "Remove the hosts block section and flush the DNS cache.",
             T.MUTED,
         ),
     }
 
-    DESTRUCTIVE = {"reset", "activate", "restore", "unfreeze", "remove_auto_reset"}
+    DESTRUCTIVE = {"reset", "activate", "deactivate", "restore", "unfreeze", "remove_auto_reset"}
+    # Actions safe without elevation (read-only or plain process start).
+    NO_ADMIN = {"launch", "diagnostics"}
 
     def __init__(self):
         super().__init__()
@@ -620,6 +631,7 @@ class MainWindow(QMainWindow):
         self.worker: Optional[EngineWorker] = None
         self.status_worker: Optional[StatusWorker] = None
         self._busy = False
+        self._hero_action: str = ""
         self._history: List[Dict[str, Any]] = []
         self._nav: Dict[str, QPushButton] = {}
         self._cards: Dict[str, ActionCard] = {}
@@ -792,6 +804,50 @@ class MainWindow(QMainWindow):
             "Dashboard",
             "Live overview of Internet Download Manager on this machine.",
         )
+
+        # ── Health banner (smart recommendation) ─────────────────────
+        self.hero = QFrame()
+        self.hero.setProperty("card", "true")
+        hl = QVBoxLayout(self.hero)
+        hl.setContentsMargins(20, 16, 20, 16)
+        hl.setSpacing(8)
+
+        toprow = QHBoxLayout()
+        toprow.setSpacing(10)
+        self.hero_dot = QLabel("●")
+        self.hero_dot.setStyleSheet(
+            f"color:{T.MUTED};font-size:16px;background:transparent;"
+        )
+        toprow.addWidget(self.hero_dot)
+        self.hero_title = QLabel("Checking IDM…")
+        self.hero_title.setStyleSheet("font-size:16px;font-weight:800;")
+        toprow.addWidget(self.hero_title, 1)
+        self.hero_btn = QPushButton("Fix now")
+        set_role(self.hero_btn, "primary")
+        self.hero_btn.hide()
+        self.hero_btn.clicked.connect(self._hero_run)
+        self._quick_btns.append(self.hero_btn)
+        toprow.addWidget(self.hero_btn)
+        hl.addLayout(toprow)
+
+        self.hero_detail = QLabel("Probing registry and hosts file…")
+        self.hero_detail.setStyleSheet(f"color:{T.MUTED};font-size:12px;")
+        self.hero_detail.setWordWrap(True)
+        hl.addWidget(self.hero_detail)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(8)
+        self.chip_reg = QLabel("…")
+        self.chip_frozen = QLabel("…")
+        self.chip_upd = QLabel("…")
+        self.chip_trial = QLabel("…")
+        for c in (self.chip_reg, self.chip_frozen, self.chip_upd, self.chip_trial):
+            c.setStyleSheet(f"color:{T.DIM};font-size:11px;font-weight:700;background:transparent;")
+            chips.addWidget(c)
+        chips.addStretch()
+        hl.addLayout(chips)
+        lay.addWidget(self.hero)
+
         grid = QGridLayout()
         grid.setSpacing(12)
         self.card_idm = StatCard("IDM")
@@ -811,18 +867,26 @@ class MainWindow(QMainWindow):
         quick.setProperty("card", "true")
         ql = QVBoxLayout(quick)
         ql.setContentsMargins(18, 16, 18, 16)
-        ql.addWidget(QLabel("Quick actions"))
+        head = QLabel("Quick actions")
+        head.setStyleSheet(f"color:{T.MUTED};font-size:11px;font-weight:700;")
+        ql.addWidget(head)
         row = QHBoxLayout()
+        row.setSpacing(8)
         for key, label, role in (
-            ("reset", "Reset trial", "success"),
-            ("freeze", "Freeze", "primary"),
+            ("activate", "Activate", "primary"),
+            ("freeze", "Freeze", "success"),
+            ("reset", "Reset trial", "ghost"),
             ("block_updates", "Block updates", "danger"),
+            ("launch", "Open IDM", "ghost"),
+            ("diagnostics", "Save report…", "ghost"),
             ("backup", "Backup…", "ghost"),
         ):
             b = QPushButton(label)
             set_role(b, role)
             if key == "backup":
                 b.clicked.connect(self._do_backup)
+            elif key == "diagnostics":
+                b.clicked.connect(self._do_diagnostics)
             else:
                 b.clicked.connect(partial(self.run_action, key))
             self._quick_btns.append(b)
@@ -842,7 +906,8 @@ class MainWindow(QMainWindow):
     def _page_operations(self) -> QWidget:
         page, lay = self._shell(
             "Operations",
-            "Core trial, freeze, and update-control workflows.",
+            "Pick ONE action — Reset = plain 30-day trial · Freeze = perpetual "
+            "trial · Activate = registered, no nags (recommended when expired).",
         )
         grid = QGridLayout()
         grid.setSpacing(12)
@@ -1123,7 +1188,7 @@ class MainWindow(QMainWindow):
             self._append_log(f"Ignored bad action payload: {action!r}", "error")
             return
 
-        if not is_admin():
+        if not is_admin() and action not in self.NO_ADMIN:
             reply = QMessageBox.question(
                 self,
                 "Administrator required",
@@ -1234,7 +1299,57 @@ class MainWindow(QMainWindow):
         self.status_worker.done.connect(self._apply_status)
         self.status_worker.start()
 
+    @staticmethod
+    def _chip(label: QLabel, text: str, tone: str) -> None:
+        color = {"good": T.GREEN, "warn": T.YELLOW, "bad": T.RED, "off": T.MUTED}.get(tone, T.MUTED)
+        label.setText(text)
+        label.setStyleSheet(
+            f"color:{color};border:1px solid {color};border-radius:10px;"
+            f"padding:2px 10px;font-size:11px;font-weight:700;background:transparent;"
+        )
+
+    def _hero_run(self, *_args) -> None:
+        if self._hero_action:
+            self.run_action(self._hero_action)
+
+    def _do_diagnostics(self, *_args) -> None:
+        default = f"idm_diagnostics_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostics report", default, "Text (*.txt);;All files (*.*)",
+        )
+        if not path:
+            return
+        self.run_action("diagnostics", path=path)
+
     def _apply_status(self, st: IDMStatus) -> None:
+        # ── Health banner ──────────────────────────────────────────
+        tone_color = {"good": T.GREEN, "warn": T.YELLOW, "bad": T.RED}.get(st.rec_tone, T.MUTED)
+        self.hero_dot.setStyleSheet(
+            f"color:{tone_color};font-size:16px;background:transparent;"
+        )
+        self.hero_title.setText(st.rec_title or "IDM status")
+        self.hero_detail.setText(st.rec_detail)
+        self._hero_action = st.recommended
+        if st.recommended and st.recommended in self.ACTIONS:
+            self.hero_btn.setText(f"Run: {self.ACTIONS[st.recommended][0]}")
+            self.hero_btn.show()
+        else:
+            self.hero_btn.hide()
+
+        self._chip(self.chip_reg, "✓ Registered" if st.registered else "Unregistered",
+                   "good" if st.registered else "warn")
+        self._chip(self.chip_frozen, "✓ Trackers locked" if st.frozen else "Trackers writable",
+                   "good" if st.frozen else "warn")
+        self._chip(self.chip_upd, "✓ Updates blocked" if st.updates_blocked else "Updates open",
+                   "good" if st.updates_blocked else "warn")
+        if st.expired:
+            self._chip(self.chip_trial, "Trial EXPIRED", "bad")
+        elif st.days_left is not None:
+            self._chip(self.chip_trial, f"Trial: {st.days_left} day(s) left",
+                       "good" if st.days_left > 7 else "warn")
+        else:
+            self._chip(self.chip_trial, "No trial counter", "off")
+
         if st.installed:
             self.card_idm.set_state(
                 "Installed", T.GREEN,

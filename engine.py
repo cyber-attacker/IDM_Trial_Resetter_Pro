@@ -59,7 +59,7 @@ if os.name != "nt":
 
 import winreg
 
-VERSION = "5.2.0"
+VERSION = "5.3.0"
 APP_NAME = "IDM Trial Resetter Pro"
 APP_ORG = "IDMTools"
 
@@ -200,6 +200,12 @@ class IDMStatus:
     auto_reset: bool = False
     process_running: bool = False
     exe_path: str = ""
+    days_left: Optional[int] = None
+    expired: bool = False
+    recommended: str = ""   # action key to run next ("" = nothing needed)
+    rec_tone: str = ""      # 'good' | 'warn' | 'bad'
+    rec_title: str = ""
+    rec_detail: str = ""
     trial_markers: List[str] = field(default_factory=list)
     clsid_hits: List[str] = field(default_factory=list)
     details: List[str] = field(default_factory=list)
@@ -210,6 +216,82 @@ class IDMStatus:
         if self.trial_clean:
             return "Clean trial"
         return "Tracking active"
+
+
+def recommend(st: IDMStatus) -> None:
+    """Attach a smart 'what should I run now?' advisory to the status.
+
+    Decision table (latest IDM 6.4x):
+      expired trial            -> Activate  (one click: reset+register+lock+block)
+      fresh/counting trial     -> Freeze    (perpetual trial) or Activate
+      registered + unlocked    -> Freeze    (IDM can rebuild the trial clock)
+      registered + open net    -> Block Updates (serial revalidation nag)
+      fully protected          -> nothing   (registered + locked + blocked)
+    """
+    if not st.installed:
+        st.recommended, st.rec_tone = "", "bad"
+        st.rec_title = "IDM not found"
+        st.rec_detail = (
+            "Internet Download Manager is not installed on this machine "
+            "(no registry key, no binary)."
+        )
+        return
+    if st.registered and st.frozen and st.updates_blocked:
+        st.recommended, st.rec_tone = "", "good"
+        st.rec_title = "Fully protected — nothing to do"
+        st.rec_detail = (
+            "IDM is registered, every tracker key is ACL-locked and "
+            "update/activation servers are blocked. Just use IDM."
+        )
+        return
+    if st.registered:
+        if not st.frozen:
+            st.recommended, st.rec_tone = "freeze", "warn"
+            st.rec_title = "Registered — tracker keys still writable"
+            st.rec_detail = (
+                "CLSID tracker keys are unlocked, so IDM can rebuild its "
+                "trial clock and bring the nag back. Run Freeze to lock them."
+            )
+        else:
+            st.recommended, st.rec_tone = "block_updates", "warn"
+            st.rec_title = "Registered — update servers reachable"
+            st.rec_detail = (
+                "IDM can phone home and revalidate the serial "
+                "(fake-serial nag) or silently self-update. Run Block Updates."
+            )
+        return
+    if st.expired:
+        st.recommended, st.rec_tone = "activate", "bad"
+        st.rec_title = "Trial period is over"
+        st.rec_detail = (
+            "Run Activate — one click resets, registers IDM with a serial, "
+            "locks every tracker key and blocks phone-home servers. "
+            "Prefer staying on trial? Run Freeze instead."
+        )
+        return
+    if st.frozen:
+        st.recommended, st.rec_tone = "", "good"
+        st.rec_title = "Frozen trial — never expires"
+        st.rec_detail = (
+            "Tracker keys are ACL-locked, so the trial clock cannot advance. "
+            "Nothing else needed."
+        )
+        return
+    if st.trial_clean:
+        st.recommended, st.rec_tone = "freeze", "warn"
+        st.rec_title = "Fresh trial — lock it now"
+        st.rec_detail = (
+            "Trial state is clean. Run Freeze before IDM advances the "
+            "counter (perpetual trial), or Activate to register instead."
+        )
+        return
+    st.recommended, st.rec_tone = "freeze", "warn"
+    left = st.days_left if st.days_left is not None else 30
+    st.rec_title = f"Trial counting down — about {left} day(s) left"
+    st.rec_detail = (
+        "Run Freeze for a never-expiring trial, or Activate for a fully "
+        "registered IDM with no nags."
+    )
 
 
 def is_admin() -> bool:
@@ -1159,7 +1241,113 @@ try {{
             )
         return ActionResult(
             "activate", False, total=frozen, details=details,
-            error="Registration could not be written", duration_ms=ms,
+            error="Registration could not be written",
+        )
+
+    def deactivate(self) -> ActionResult:
+        """Inverse of Activate: removes the registration, unfreezes the
+        tracker keys, removes the hosts block and leaves a clean day-1
+        trial (no serial, no locks, updates allowed)."""
+        t0 = datetime.datetime.now()
+        self.log("═" * 54, "header")
+        self.log("  DEACTIVATE  —  unregister + unfreeze + unblock + reset", "header")
+        self.log("═" * 54, "header")
+        self.kill_idm()
+
+        self.progress(1, 3, "Unfreezing trackers")
+        self.log("\n[1/3] Restoring ACL write access on tracker keys …")
+        self.unfreeze_trial()
+
+        self.progress(2, 3, "Removing hosts block")
+        self.log("\n[2/3] Removing hosts block (update servers reachable again) …")
+        self.unblock_updates()
+
+        self.progress(3, 3, "Resetting to a clean trial")
+        self.log("\n[3/3] Full trial reset (removes FName/LName/Email/Serial) …")
+        res = self.reset_trial()
+
+        ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
+        dm = r"Software\DownloadManager"
+        gone = all(
+            get_value(winreg.HKEY_CURRENT_USER, dm, v) is None
+            for v in ("FName", "LName", "Email", "Serial")
+        )
+        if res.success and gone:
+            self.log(
+                "\n  ✓ DEACTIVATED — unregistered, unlocked, clean 30-day trial",
+                "success",
+            )
+            return ActionResult(
+                "deactivate", True, details=res.details + ["unregistered"],
+                duration_ms=ms,
+            )
+        return ActionResult(
+            "deactivate", False, details=res.details,
+            error=res.error or "Registration values still present",
+            duration_ms=ms,
+        )
+
+    def launch_idm(self) -> ActionResult:
+        """Start IDMan.exe (no admin rights needed)."""
+        t0 = datetime.datetime.now()
+        exe = self._find_exe()
+        if not exe:
+            return ActionResult("launch", False, error="IDM executable not found")
+        try:
+            subprocess.Popen([exe], creationflags=CREATE_NO_WINDOW)
+            self.log(f"  ✓ Started {exe}", "success")
+            return ActionResult(
+                "launch", True, details=[exe],
+                duration_ms=int((datetime.datetime.now() - t0).total_seconds() * 1000),
+            )
+        except Exception as e:
+            return ActionResult("launch", False, error=str(e))
+
+    def export_diagnostics(self, path: str) -> ActionResult:
+        """Write a human-readable status report for support / debugging."""
+        t0 = datetime.datetime.now()
+        st = self.check_status()
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        trial = "expired" if st.expired else (
+            f"{st.days_left} day(s) left" if st.days_left is not None else "no counter"
+        )
+        lines = [
+            f"{APP_NAME} v{VERSION} — diagnostics report",
+            f"Generated: {ts}",
+            "=" * 62,
+            "",
+            f"Installed:       {st.installed}",
+            f"Binary version:  {st.version}",
+            f"idmvers:         {st.idmvers}",
+            f"Registered:      {st.registered}"
+            + (f"  ({st.registrant})" if st.registered else ""),
+            f"Frozen:          {st.frozen}",
+            f"Updates blocked: {st.updates_blocked}",
+            f"Trial state:     {trial}",
+            f"Auto-reset task: {st.auto_reset}",
+            f"IDM running:     {st.process_running}",
+            f"EXE:             {st.exe_path or '—'}",
+            "",
+            f"Recommendation:  {st.rec_title}",
+            f"  {st.rec_detail}",
+            "",
+            "Trial markers:",
+            f"  {', '.join(st.trial_markers) if st.trial_markers else '(none)'}",
+            "",
+            "CLSID tracker keys:",
+        ]
+        lines += [f"  {h}" for h in st.clsid_hits] or ["  (none)"]
+        lines += ["", "Details:"]
+        lines += [f"  · {d}" for d in st.details]
+        lines += ["", f"— {APP_NAME} (engine v{VERSION})", ""]
+        try:
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            return ActionResult("diagnostics", False, error=str(e))
+        self.log(f"  ✓ Diagnostics report → {path}", "success")
+        return ActionResult(
+            "diagnostics", True, details=[str(path)],
+            duration_ms=int((datetime.datetime.now() - t0).total_seconds() * 1000),
         )
 
     def _find_exe(self) -> Optional[str]:
@@ -1407,10 +1595,11 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
         if radx is not None:
             try:
                 cnt = int(radx[0])
-                left = 30 - cnt
+                st.days_left = 30 - cnt
+                st.expired = st.days_left <= 0
                 st.details.append(
                     f"Trial counter radxcnt={cnt} "
-                    + ("(EXPIRED)" if left <= 0 else f"(~{left} day(s) left)")
+                    + ("(EXPIRED)" if st.expired else f"(~{st.days_left} day(s) left)")
                 )
             except (TypeError, ValueError):
                 pass
@@ -1481,6 +1670,7 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
         if st.process_running:
             st.details.append("IDM process running")
 
+        recommend(st)
         return st
 
     def run(self, action: str, **kwargs) -> ActionResult:
@@ -1497,6 +1687,11 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
                 kwargs.get("email", ""),
                 serial=kwargs.get("serial", ""),
                 block_updates=bool(kwargs.get("block_updates", True)),
+            ),
+            "deactivate": self.deactivate,
+            "launch": self.launch_idm,
+            "diagnostics": lambda: self.export_diagnostics(
+                kwargs.get("path", str(Path.home() / "idm_diagnostics.txt"))
             ),
             "block_updates": self.block_updates,
             "unblock_updates": self.unblock_updates,

@@ -3,7 +3,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
-![Version](https://img.shields.io/badge/version-5.2.0-blue)
+![Version](https://img.shields.io/badge/version-5.3.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Professional Windows desktop tool to **inspect, reset, freeze, and manage the Internet Download Manager (IDM) trial state**. Dark Fusion UI, live registry calibration for IDM **6.42 / 6.43+**, one-file admin EXE build, backups, and optional trial auto-reset via Task Scheduler.
@@ -16,11 +16,14 @@ Professional Windows desktop tool to **inspect, reset, freeze, and manage the In
 
 | Feature | Description |
 |--------|-------------|
+| **Smart advisor (5.3)** | Dashboard health banner analyzes your exact state and tells you the ONE action to run — with a **Fix now** button |
 | **Live status dashboard** | Detects install path, version, trial vs registered, trial markers, CLSID hits, freeze / hosts / auto-reset state |
 | **Trial reset** | Clears DownloadManager trial values, `ConfigTime` / `SpecialData`, CLSID markers (incl. ACL-locked keys), related HKU / HKLM keys |
 | **Freeze / Unfreeze** | Wipes trial state, seeds missing CLSID keys and ACL-locks **all** tracking keys (incl. IDM's rotating GUIDs) so the trial clock can never be persisted — the fix for the recurring "trial period is over" nag |
 | **Activate pipeline** | Reset → seed → lock → register with an IAS-format serial → sinkhole update/activation servers → brief IDM start → re-lock. Verified: IDM switches itself to `Full` mode and stops nagging |
+| **Deactivate (5.3)** | One-click undo of Activate: removes the serial, unfreezes trackers, removes the hosts block, leaves a clean day-1 trial |
 | **Block / Unblock updates** | Sinkholes IDM update domains in the system `hosts` file + DNS flush |
+| **Open IDM + diagnostics report (5.3)** | Launch IDMan.exe from the dashboard; export a shareable status report |
 | **Backup & restore** | Registry + AppData snapshots under `%AppData%\IDMTools\IDMTrialResetterPro` |
 | **Auto-reset** | Optional scheduled task for silent headless resets (`--auto-reset`) |
 | **Professional UI** | Dashboard, Operations, Backup, History, Settings, Console, system tray |
@@ -50,6 +53,22 @@ Calibrated against a live, **expired** IDM **6.43.10** (`v6.43b10 Trial`) instal
 - `%APPDATA%\IDM\idmupdt.exe` — downloaded self-updater payload (removed during reset)
 - **ConfigTime watchdog** — IDM 6.43.x's `IDMShellExt64.dll`/`IDMNetMon64.dll` (loaded inside `explorer.exe` and other shell hosts) re-creates `ConfigTime` from a cached copy ~1s after deletion. Verified harmless: with a planted stale `ConfigTime`, IDM still starts a fresh trial (`radxcnt = 1`) and rewrites the clock itself. The resetter detects the restore and re-anchors `ConfigTime` to *now* — the exact state of a fresh install
 - Dynamic CLSID discovery heuristics (marker values, numeric/encoded defaults, empty seed keys) so future GUID rotations are still caught
+
+---
+
+## Which action should I run? (latest IDM 6.4x)
+
+**Pick ONE action — never chain them.** Activate already includes a full reset; Freeze already wipes state.
+
+| Your situation | Run this | Result |
+|---|---|---|
+| Trial is **over / expired** | **Activate** | One click: reset → register with serial → lock every tracker → block phone-home servers. IDM shows `Full`, no expiry, no nag |
+| Don't want to register, just never expire | **Freeze** | Wipes state and ACL-locks every tracker key. Trial stays day-1 forever |
+| Want a plain, honest 30-day trial | **Reset Trial** | Deep-clean only — no serial, no locks. Trial counts down again and expires in ~30 days |
+| Want to undo Activate | **Deactivate** | Removes serial + locks + hosts block → clean day-1 trial |
+| Registered but nag returned | **Block Updates** (+ check Freeze) | Stops serial revalidation (fake-serial nag) and silent self-updates |
+
+The dashboard health banner makes this decision for you and shows a **Fix now** button for the recommended action.
 
 ---
 
@@ -239,7 +258,8 @@ Visitors use **Releases** → **Assets** → download EXE. Source stays in the C
 Engine API surface (`IDMEngine`):
 
 ```text
-check_status · reset_trial · freeze_trial · unfreeze_trial · activate
+check_status · reset_trial · freeze_trial · unfreeze_trial · activate · deactivate
+launch_idm · export_diagnostics · recommend
 block_updates · unblock_updates · backup · restore
 setup_auto_reset · remove_auto_reset · kill_idm
 ```
@@ -296,6 +316,15 @@ python -c "import ast; ast.parse(open('engine.py',encoding='utf-8').read()); ast
 ---
 
 ## Changelog
+
+### 5.3.0
+
+- **Smart advisor**: `recommend()` decision table + dashboard health banner (● green/yellow/red) that names the exact action to run and offers a one-click **Fix now** button — expired trial → Activate, counting trial → Freeze, registered+unlocked → Freeze, registered+open net → Block Updates, fully protected → "nothing to do"
+- Status pills on the dashboard: Registered · Trackers locked · Updates blocked · Trial days left (from `radxcnt`, EXPIRED state in red)
+- **Deactivate** action — inverse of Activate: unfreeze → remove hosts block → full reset (drops FName/LName/Email/Serial) → verified unregistered clean trial
+- **Open IDM** quick action (launches `IDMan.exe`, no elevation required) and **diagnostics report** export (shareable status/marker/tracker summary)
+- Engine: `IDMStatus.days_left` / `expired` computed from `radxcnt`; action cards rewritten to answer "Reset vs Freeze vs Activate" inline
+- Non-admin users can now use Open IDM / diagnostics without a UAC prompt
 
 ### 5.2.0
 
