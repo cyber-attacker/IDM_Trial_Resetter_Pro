@@ -28,6 +28,14 @@ Anti-reset defenses handled (verified live):
     copy ~1s after deletion. Verified harmless (IDM overwrites ConfigTime at
     the next fresh start — a stale planted copy did NOT resurrect the old
     trial day counter), and the resetter re-anchors it to NOW.
+  * the recurring "trial period is over" nag with otherwise-fresh state:
+    the trial clock is re-derived from the CLSID tracking copies, so a
+    freeze that leaves ANY tracking key writable fails (observed here:
+    {07999AC3-…} stayed writable and IDM rebuilt the clock in it). Freeze
+    now wipes the DownloadManager state, SEEDS both tracking keys when
+    missing, and locks every one of them. Activate goes further: registers
+    IDM with an IAS-format serial, locks the CLSID keys and sinkholes the
+    update/activation domains so the serial is never server-validated.
 """
 from __future__ import annotations
 
@@ -35,6 +43,7 @@ import os
 import sys
 import re
 import json
+import random
 import shutil
 import ctypes
 import datetime
@@ -50,7 +59,7 @@ if os.name != "nt":
 
 import winreg
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 APP_NAME = "IDM Trial Resetter Pro"
 APP_ORG = "IDMTools"
 
@@ -74,6 +83,15 @@ IDM_CLSID_GUIDS = [
     "{D5B91409-A8CA-4973-9A0B-59F713D25671}",
     "{5ED60779-4DE2-4E07-B862-974CA4FF2E9C}",
 ]
+
+# The two GUIDs 6.42/6.43 actively writes trial state into (observed live:
+# {07999AC3-…} recreated on every fresh start, {5ED60779-…} present in the
+# expired state). The other three are legacy keys kept for older builds,
+# and 6.43 additionally rotates fresh GUIDs — caught by the dynamic scan.
+ACTIVE_TRACKER_GUIDS = (
+    "{07999AC3-058B-40BF-984F-69EB1E554CA7}",
+    "{5ED60779-4DE2-4E07-B862-974CA4FF2E9C}",
+)
 
 CLSID_MARKERS = ("MData", "Model", "scansk", "Therad", "tvfrdt", "cDTvBFquXk0")
 
@@ -140,6 +158,16 @@ PS_PRIVILEGES = (
     "9,17,18|ForEach-Object{"
     "$tb.CreateType()::RtlAdjustPrivilege($_,$true,$false,[ref]$false)|Out-Null};"
 )
+
+# Registration serial generator (IAS-compatible format:
+# XXXXX-XXXXX-XXXXX-XXXXX, 20 chars from A-Z0-9 — accepted by IDM 6.4x).
+SERIAL_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def generate_serial() -> str:
+    rnd = random.SystemRandom()
+    chars = [rnd.choice(SERIAL_CHARSET) for _ in range(20)]
+    return "-".join("".join(chars[i:i + 5]) for i in range(0, 20, 5))
 
 
 @dataclass
@@ -289,6 +317,31 @@ def probe_values(root: int, subkey: str) -> Tuple[List[str], bool]:
         return [], True
     except OSError:
         return [], False
+
+
+def current_user_classes() -> Optional[str]:
+    """The `<SID>_Classes` subkey of HKEY_USERS that mirrors the CURRENT
+    user's HKCU\\Software\\Classes (IAS 'HKCUsync' check). Scans must skip
+    that mirror: it is the same physical key as the HKCU target, and
+    operating on both doubles work and reports false failures."""
+    marker = "_IDMTR_SID_PROBE"
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\{marker}"):
+            pass
+    except OSError:
+        return None
+    found: Optional[str] = None
+    for sid in enum_keys(winreg.HKEY_USERS, ""):
+        if not sid.endswith("_Classes"):
+            continue
+        if reg_exists(winreg.HKEY_USERS, rf"{sid}\{marker}"):
+            found = sid
+            break
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\{marker}")
+    except OSError:
+        pass
+    return found
 
 
 def enum_keys(root: int, subkey: str) -> List[str]:
@@ -483,16 +536,18 @@ class IDMEngine:
             sids = enum_keys(winreg.HKEY_USERS, "")
         except OSError:
             sids = []
+        # The current user's HKU\<SID>_Classes mirror is the same physical
+        # key as HKCU\Software\Classes — skip it (IAS 'HKCUsync' behavior).
+        own_classes = current_user_classes()
+        hku_sids = [s for s in sids if s.endswith("_Classes") and s != own_classes]
 
         # 1. Known IDM GUIDs across every hive mirror (locked keys included).
         for guid in IDM_CLSID_GUIDS:
             for root, base in CLSID_BASES:
                 add(root, f"{base}\\{guid}", "known")
 
-        # 2. Per-user Classes mirrors of the known GUIDs.
-        for sid in sids:
-            if not sid.endswith("_Classes"):
-                continue
+        # 2. Per-user Classes mirrors of the known GUIDs (other users only).
+        for sid in hku_sids:
             for sub in (rf"{sid}\CLSID", rf"{sid}\WOW6432Node\CLSID"):
                 for guid in IDM_CLSID_GUIDS:
                     add(winreg.HKEY_USERS, f"{sub}\\{guid}", "HKU")
@@ -508,12 +563,10 @@ class IDMEngine:
             (winreg.HKEY_CURRENT_USER, r"Software\Classes\WOW6432Node\CLSID"),
         ]
         dynamic_bases += [
-            (winreg.HKEY_USERS, rf"{sid}\CLSID")
-            for sid in sids if sid.endswith("_Classes")
+            (winreg.HKEY_USERS, rf"{sid}\CLSID") for sid in hku_sids
         ]
         dynamic_bases += [
-            (winreg.HKEY_USERS, rf"{sid}\WOW6432Node\CLSID")
-            for sid in sids if sid.endswith("_Classes")
+            (winreg.HKEY_USERS, rf"{sid}\WOW6432Node\CLSID") for sid in hku_sids
         ]
         guid_re = re.compile(
             r"^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}"
@@ -704,17 +757,17 @@ try {{
         self.log("\n[5/7] HKLM machine keys …")
         hklm_n = 0
         for root, path in HKLM_IDM_PATHS:
-            if reg_exists(root, path):
-                for val in ("FName", "LName", "Email", "Serial"):
-                    ok, _ = delete_value(root, path, val)
-                    if ok:
-                        hklm_n += 1
-                        self.log(f"  ✓ Cleared {hive_label(root)}\\…\\{val}", "success")
+            ok, _ = delete_key_tree(root, path)
+            if ok:
+                hklm_n += 1
+                self.log(f"  ✓ Cleared {hive_label(root)}\\{path}", "success")
         try:
-            flag_path = r"Software\WOW6432Node\Internet Download Manager"
-            with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, flag_path) as k:
+            with winreg.CreateKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\WOW6432Node\Internet Download Manager",
+            ) as k:
                 winreg.SetValueEx(k, "AdvIntDriverEnabled2", 0, winreg.REG_DWORD, 1)
-            self.log("  ✓ AdvIntDriverEnabled2 = 1", "success")
+            self.log("  ✓ AdvIntDriverEnabled2 = 1 (key recreated clean)", "success")
         except PermissionError:
             self.log("  ! Could not set AdvIntDriverEnabled2 (need admin)", "warning")
         except OSError as e:
@@ -796,33 +849,63 @@ try {{
         self.log("═" * 54, "header")
         return ActionResult("reset", True, total=removed + n, details=details, duration_ms=ms)
 
-    def freeze_trial(self) -> ActionResult:
-        t0 = datetime.datetime.now()
-        self.log("═" * 54, "header")
-        self.log("  FREEZE TRIAL  —  lock CLSID keys via ACL deny", "header")
-        self.log("═" * 54, "header")
-        self.kill_idm()
+    def _soft_reset(self) -> None:
+        """Quiet trial-state wipe used by Freeze / Activate: clears the
+        DownloadManager trial values + clock subkeys and recreates the HKLM
+        key clean (parity with the IAS delete_queue + add_key flow)."""
+        dm = r"Software\DownloadManager"
+        for val in DM_TRIAL_VALUES:
+            delete_value(winreg.HKEY_CURRENT_USER, dm, val)
+        for sub in DM_TRIAL_SUBKEYS:
+            delete_key_tree(winreg.HKEY_CURRENT_USER, rf"{dm}\{sub}")
+        for root, path in HKLM_IDM_PATHS:
+            delete_key_tree(root, path)
+        try:
+            with winreg.CreateKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\WOW6432Node\Internet Download Manager",
+            ) as k:
+                winreg.SetValueEx(k, "AdvIntDriverEnabled2", 0, winreg.REG_DWORD, 1)
+        except OSError:
+            pass
 
-        self.progress(1, 3, "Locating CLSID keys")
-        self.log("\n[1/3] Locating CLSID keys …")
-        keys = self.collect_clsid_targets()
-        if not keys:
-            self.log("  ! No CLSID keys. Run Reset first, launch IDM once, then Freeze.", "warning")
-            return ActionResult("freeze", False, error="No CLSID keys found")
+    def _ensure_clsid_keys(self) -> int:
+        """Create the active IDM CLSID GUID keys (empty) when absent.
 
-        self.log(f"\n[2/3] Freezing {len(keys)} key(s) …")
-        self.progress(2, 3, "Applying ACL locks")
+        Freezing only works while EVERY tracking copy is locked. If a key is
+        missing, IDM simply re-creates it writable and resumes counting —
+        the exact failure mode observed on this machine, where a previous
+        freeze left {07999AC3-…} absent and IDM rebuilt the trial clock in it.
+        """
+        created = 0
+        for guid in ACTIVE_TRACKER_GUIDS:
+            for root, base in CLSID_BASES[:2]:  # HKCU Classes\CLSID + WOW6432Node
+                full = f"{base}\\{guid}"
+                if reg_state(root, full) == "absent":
+                    try:
+                        winreg.CreateKey(root, full)
+                        created += 1
+                        self.log(
+                            f"  · Created {hive_label(root)}\\…\\{guid[:20]}… "
+                            "(seed so the lock covers it)",
+                            "info",
+                        )
+                    except OSError as e:
+                        self.log(f"  ! create {guid[:20]}…: {e}", "warning")
+        return created
 
+    def _lock_clsid_targets(self, keys: List[Tuple[int, str, str]]) -> Tuple[int, int]:
+        """Apply deny-Everyone ACL locks to the given CLSID targets.
+        Returns (frozen, failed)."""
         blocks = []
         for root, full, label in keys:
             safe = label.replace("'", "")
-            if root == winreg.HKEY_USERS:
-                blocks.append(self._ps_freeze_hku(full, safe))
-                continue
             if root == winreg.HKEY_CURRENT_USER:
                 root_expr = "[Microsoft.Win32.Registry]::CurrentUser"
             elif root == winreg.HKEY_LOCAL_MACHINE:
                 root_expr = "[Microsoft.Win32.Registry]::LocalMachine"
+            elif root == winreg.HKEY_USERS:
+                root_expr = "[Microsoft.Win32.Registry]::Users"
             else:
                 continue
             path_esc = full.replace("'", "''")
@@ -854,49 +937,58 @@ try {{
   Write-Output 'FROZEN: {safe}'
 }} catch {{ Write-Output ("FAILED: {safe} - " + $_.Exception.Message) }}
 """)
-
-        _, stdout, stderr = run_powershell(PS_PRIVILEGES + "\n" + "\n".join(blocks), timeout=120)
+        if not blocks:
+            return 0, 0
+        _, stdout, _stderr = run_powershell(
+            PS_PRIVILEGES + "\n" + "\n".join(blocks), timeout=120,
+        )
         frozen = failed = 0
         for line in (stdout or "").splitlines():
             line = line.strip()
             if line.startswith("FROZEN:"):
                 frozen += 1
-                self.log(f"  ✓ {line[7:].strip()}", "success")
+                self.log(f"  ✓ Locked {line[7:].strip()}", "success")
             elif line.startswith("FAILED:"):
                 failed += 1
                 self.log(f"  ✗ {line}", "error")
+        return frozen, failed
 
-        self.progress(3, 3, "Done")
+    def freeze_trial(self) -> ActionResult:
+        t0 = datetime.datetime.now()
+        self.log("═" * 54, "header")
+        self.log("  FREEZE TRIAL  —  wipe state, then ACL-lock ALL CLSID keys", "header")
+        self.log("═" * 54, "header")
+        self.kill_idm()
+
+        self.progress(1, 3, "Wiping trial state")
+        self.log("\n[1/3] Wiping current trial state (lock must freeze a FRESH trial) …")
+        self._soft_reset()
+        self.log("  ✓ Trial values and clocks cleared", "success")
+
+        self.progress(2, 3, "Locating / seeding CLSID keys")
+        self.log("\n[2/3] Locating CLSID tracking keys (missing ones are seeded) …")
+        self._ensure_clsid_keys()
+        keys = self.collect_clsid_targets()
+        if not keys:
+            self.log("  ! No CLSID keys found to freeze.", "warning")
+            return ActionResult("freeze", False, error="No CLSID keys found")
+
+        self.log(f"\n[3/3] Locking {len(keys)} key(s) …")
+        self.progress(3, 3, "Applying ACL locks")
+        frozen, failed = self._lock_clsid_targets(keys)
+
         ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
         if frozen > 0:
-            self.log(f"\n  ✓ Frozen {frozen} key(s) — trial clock locked", "success")
+            self.log(f"\n  ✓ Frozen {frozen} key(s) — trial starts fresh and cannot advance", "success")
             return ActionResult(
                 "freeze", True, total=frozen,
                 details=[f"Frozen: {frozen}", f"Failed: {failed}"], duration_ms=ms,
             )
         return ActionResult(
             "freeze", False, details=[f"Failed: {failed}"],
-            error=(stderr or "No keys frozen — run as Administrator")[:200],
+            error="No keys frozen — run as Administrator",
             duration_ms=ms,
         )
-
-    def _ps_freeze_hku(self, full: str, safe: str) -> str:
-        path = full.replace("'", "''")
-        return f"""
-try {{
-  $p = 'Registry::HKEY_USERS\\{path}'
-  $acl = Get-Acl $p
-  $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
-  Set-Acl -Path $p -AclObject $acl
-  $acl = Get-Acl $p
-  $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-    [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
-    'FullControl','ContainerInherit,ObjectInherit','None','Deny')
-  $acl.ResetAccessRule($rule)
-  Set-Acl -Path $p -AclObject $acl
-  Write-Output 'FROZEN: {safe}'
-}} catch {{ Write-Output ("FAILED: {safe} - " + $_.Exception.Message) }}
-"""
 
     def unfreeze_trial(self) -> ActionResult:
         t0 = datetime.datetime.now()
@@ -927,27 +1019,14 @@ try {{
         blocks = []
         for root, full, label in keys:
             safe = label.replace("'", "")
-            if root == winreg.HKEY_USERS:
-                path = full.replace("'", "''")
-                blocks.append(f"""
-try {{
-  $p = 'Registry::HKEY_USERS\\{path}'
-  $acl = Get-Acl $p -ErrorAction Stop
-  $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
-  $acl.SetAccessRuleProtection($false, $true)
-  foreach ($ace in @($acl.GetAccessRules($true,$true,[System.Security.Principal.NTAccount]))) {{
-    if ($ace.AccessControlType -eq 'Deny') {{ $acl.RemoveAccessRule($ace) | Out-Null }}
-  }}
-  $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-    [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
-    'FullControl','ContainerInherit,ObjectInherit','None','Allow')
-  $acl.SetAccessRule($rule)
-  Set-Acl -Path $p -AclObject $acl
-  Write-Output 'UNFROZEN'
-}} catch {{ Write-Output ("FAILED: {safe} - " + $_.Exception.Message) }}
-""")
+            if root == winreg.HKEY_CURRENT_USER:
+                ps_root = "CurrentUser"
+            elif root == winreg.HKEY_LOCAL_MACHINE:
+                ps_root = "LocalMachine"
+            elif root == winreg.HKEY_USERS:
+                ps_root = "Users"
+            else:
                 continue
-            ps_root = "CurrentUser" if root == winreg.HKEY_CURRENT_USER else "LocalMachine"
             path = full.replace("'", "''")
             blocks.append(f"""
 $root = [Microsoft.Win32.Registry]::{ps_root}
@@ -987,28 +1066,71 @@ try {{
             details=[f"Unfrozen: {unfrozen}"], duration_ms=ms,
         )
 
-    def activate(self, fname: str = "User", lname: str = "", email: str = "") -> ActionResult:
+    def activate(
+        self,
+        fname: str = "",
+        lname: str = "",
+        email: str = "",
+        serial: str = "",
+        block_updates: bool = True,
+    ) -> ActionResult:
+        """IAS-parity activation pipeline for latest IDM (6.4x).
+
+        Order matters and mirrors the proven IDM-Activation-Script flow:
+        reset -> seed CLSID keys -> LOCK them -> write registration
+        (random IAS-format serial) -> block update/activation servers ->
+        brief IDM start so it picks up the registration -> re-lock anything
+        IDM re-created. Registered mode never shows the trial-expired nag,
+        and the hosts block prevents the server-side serial revalidation
+        that triggers the fake-serial nag.
+        """
         t0 = datetime.datetime.now()
+        details: List[str] = []
         self.log("═" * 54, "header")
-        self.log("  ACTIVATE  —  reset + identity + freeze", "header")
+        self.log("  ACTIVATE  —  reset + register + lock + block updates", "header")
         self.log("═" * 54, "header")
 
-        self.progress(1, 3, "Resetting")
+        self.progress(1, 6, "Resetting trial state")
+        self.log("\n[1/6] Resetting trial state …")
         self.reset_trial()
 
-        self.progress(2, 3, "Injecting registration")
-        self.log("\n[2/3] Injecting registration identity …")
+        self.progress(2, 6, "Seeding CLSID keys")
+        self.log("\n[2/6] Ensuring CLSID tracking keys exist …")
+        self._ensure_clsid_keys()
+
+        self.progress(3, 6, "Locking CLSID keys")
+        self.log("\n[3/6] Locking CLSID keys BEFORE IDM first run …")
+        keys = self.collect_clsid_targets()
+        frozen, failed = self._lock_clsid_targets(keys)
+        details.append(f"Locked: {frozen}")
+
+        self.progress(4, 6, "Injecting registration")
+        self.log("\n[4/6] Injecting registration …")
+        rnd = random.SystemRandom()
+        fn = (fname or str(rnd.randint(1000, 9999))).strip()
+        ln = (lname or str(rnd.randint(1000, 9999))).strip()
+        em = (email or f"{fn}.{ln}@tonec.com").strip()
+        key = (serial or generate_serial()).strip().upper()
         dm = r"Software\DownloadManager"
-        fn = (fname or "User").strip()
-        ln = (lname or fn).strip()
-        em = (email or f"{fn.lower().replace(' ', '')}@email.local").strip()
         set_value(winreg.HKEY_CURRENT_USER, dm, "FName", fn, winreg.REG_SZ)
         set_value(winreg.HKEY_CURRENT_USER, dm, "LName", ln, winreg.REG_SZ)
         set_value(winreg.HKEY_CURRENT_USER, dm, "Email", em, winreg.REG_SZ)
-        set_value(winreg.HKEY_CURRENT_USER, dm, "Serial", "", winreg.REG_SZ)
-        self.log(f"  ✓ Identity: {fn} {ln} <{em}>", "success")
+        set_value(winreg.HKEY_CURRENT_USER, dm, "Serial", key, winreg.REG_SZ)
+        self.log(f"  ✓ Registered as: {fn} {ln} <{em}>", "success")
+        self.log(f"  ✓ Serial: {key}", "success")
+        details.append(f"Serial: {key}")
 
-        self.log("  · Seeding CLSID keys (brief IDM start) …")
+        self.progress(5, 6, "Blocking update servers")
+        if block_updates:
+            self.log("\n[5/6] Blocking update / activation servers (kills the nag at the source) …")
+            bu = self.block_updates()
+            details.append("updates blocked" if bu.success else f"block failed: {bu.error}")
+        else:
+            self.log("\n[5/6] Hosts blocking skipped (user choice)", "info")
+            details.append("updates NOT blocked")
+
+        self.progress(6, 6, "Seeding IDM + re-locking")
+        self.log("\n[6/6] Brief IDM start so it picks up the registration …")
         exe = self._find_exe()
         if exe:
             try:
@@ -1017,15 +1139,27 @@ try {{
             except Exception as e:
                 self.log(f"  ! Could not start IDM: {e}", "warning")
             self.kill_idm()
+        relock = self.collect_clsid_targets()
+        if relock:
+            f2, _ = self._lock_clsid_targets(relock)
+            if f2:
+                details.append(f"Re-locked: {f2}")
 
-        self.progress(3, 3, "Freezing")
-        fr = self.freeze_trial()
+        check = get_value(winreg.HKEY_CURRENT_USER, dm, "Serial")
+        registered = bool(check and str(check[0]).strip())
         ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
-        self.log("\n  ✓ ACTIVATION PIPELINE COMPLETE", "success")
+        if registered and frozen > 0:
+            self.log("\n  ✓ ACTIVATION COMPLETE — registered, locked, phone-home blocked", "success")
+            return ActionResult("activate", True, total=frozen, details=details, duration_ms=ms)
+        if registered:
+            self.log("\n  · Registered, but CLSID lock incomplete — run Freeze", "warning")
+            return ActionResult(
+                "activate", False, total=frozen, details=details,
+                error="Registration written but CLSID lock incomplete", duration_ms=ms,
+            )
         return ActionResult(
-            "activate", fr.success, total=fr.total,
-            details=["Identity injected", f"Frozen: {fr.total}"],
-            error=fr.error, duration_ms=ms,
+            "activate", False, total=frozen, details=details,
+            error="Registration could not be written", duration_ms=ms,
         )
 
     def _find_exe(self) -> Optional[str]:
@@ -1301,28 +1435,6 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
                 "reset/unfreeze will take ownership and clear it"
             )
 
-        freeze_probed = False
-        guid0 = IDM_CLSID_GUIDS[0]
-        full = rf"Software\Classes\WOW6432Node\CLSID\{guid0}"
-        if reg_exists(winreg.HKEY_CURRENT_USER, full):
-            freeze_probed = True
-            ok, _ = set_value(winreg.HKEY_CURRENT_USER, full, "_idmtr_probe", 1, winreg.REG_DWORD)
-            if not ok:
-                st.frozen = True
-                st.details.append("CLSID ACL frozen (write denied)")
-            else:
-                delete_value(winreg.HKEY_CURRENT_USER, full, "_idmtr_probe")
-
-        if not freeze_probed:
-            full2 = rf"Software\Classes\WOW6432Node\CLSID\{IDM_CLSID_GUIDS[-1]}"
-            if reg_exists(winreg.HKEY_CURRENT_USER, full2):
-                try:
-                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, full2, 0, winreg.KEY_READ):
-                        pass
-                except PermissionError:
-                    st.frozen = True
-                    st.details.append("CLSID access restricted")
-
         if HOSTS_PATH.exists():
             try:
                 if HOSTS_HEADER in HOSTS_PATH.read_text(encoding="utf-8", errors="replace"):
@@ -1330,6 +1442,36 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
                     st.details.append("Hosts sinkhole active")
             except Exception:
                 pass
+
+        # Nag-risk assessment — explains the recurring "trial period is
+        # over" popup and what stops it.
+        if st.registered:
+            sv = get_value(winreg.HKEY_CURRENT_USER, dm, "Serial")
+            if sv and str(sv[0]).strip():
+                st.details.append(f"Serial: {str(sv[0])}")
+            if not st.updates_blocked:
+                st.details.append(
+                    "Registered but update servers reachable — run Block Updates "
+                    "to stop serial revalidation (fake-serial nag)"
+                )
+            if not st.frozen:
+                st.details.append(
+                    "Registered but CLSID keys unlocked — run Freeze to stop "
+                    "trial-state tracking"
+                )
+        elif st.frozen:
+            st.details.append("Frozen — IDM cannot persist trial state")
+        elif not st.trial_clean:
+            st.details.append(
+                "Trial state present and unlocked — IDM keeps counting and will "
+                "nag at expiry; run Freeze (perpetual fresh trial) or Activate "
+                "(registered, no nags)"
+            )
+        if not st.registered and not st.frozen and not st.updates_blocked:
+            st.details.append(
+                "Update checks open — IDM phones home (can re-flag this machine "
+                "and self-update); Block Updates recommended"
+            )
 
         st.auto_reset = self.has_auto_reset()
         if st.auto_reset:
@@ -1350,9 +1492,11 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
             "freeze": self.freeze_trial,
             "unfreeze": self.unfreeze_trial,
             "activate": lambda: self.activate(
-                kwargs.get("fname", "User"),
+                kwargs.get("fname", ""),
                 kwargs.get("lname", ""),
                 kwargs.get("email", ""),
+                serial=kwargs.get("serial", ""),
+                block_updates=bool(kwargs.get("block_updates", True)),
             ),
             "block_updates": self.block_updates,
             "unblock_updates": self.unblock_updates,

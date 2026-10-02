@@ -3,7 +3,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
-![Version](https://img.shields.io/badge/version-5.1.0-blue)
+![Version](https://img.shields.io/badge/version-5.2.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Professional Windows desktop tool to **inspect, reset, freeze, and manage the Internet Download Manager (IDM) trial state**. Dark Fusion UI, live registry calibration for IDM **6.42 / 6.43+**, one-file admin EXE build, backups, and optional trial auto-reset via Task Scheduler.
@@ -18,8 +18,8 @@ Professional Windows desktop tool to **inspect, reset, freeze, and manage the In
 |--------|-------------|
 | **Live status dashboard** | Detects install path, version, trial vs registered, trial markers, CLSID hits, freeze / hosts / auto-reset state |
 | **Trial reset** | Clears DownloadManager trial values, `ConfigTime` / `SpecialData`, CLSID markers (incl. ACL-locked keys), related HKU / HKLM keys |
-| **Freeze / Unfreeze** | ACL-locks or restores IDM tracking CLSID keys so the trial clock cannot advance |
-| **Activate pipeline** | Reset → inject registration identity → seed CLSID → freeze |
+| **Freeze / Unfreeze** | Wipes trial state, seeds missing CLSID keys and ACL-locks **all** tracking keys (incl. IDM's rotating GUIDs) so the trial clock can never be persisted — the fix for the recurring "trial period is over" nag |
+| **Activate pipeline** | Reset → seed → lock → register with an IAS-format serial → sinkhole update/activation servers → brief IDM start → re-lock. Verified: IDM switches itself to `Full` mode and stops nagging |
 | **Block / Unblock updates** | Sinkholes IDM update domains in the system `hosts` file + DNS flush |
 | **Backup & restore** | Registry + AppData snapshots under `%AppData%\IDMTools\IDMTrialResetterPro` |
 | **Auto-reset** | Optional scheduled task for silent headless resets (`--auto-reset`) |
@@ -232,7 +232,7 @@ Visitors use **Releases** → **Assets** → download EXE. Source stays in the C
 
 1. **Status** reads HKCU DownloadManager, file version of `IDMan.exe`, CLSID trees, hosts block markers, freeze ACLs, and optional scheduled task.
 2. **Reset** stops IDM processes, deletes/clears trial REG values and `ConfigTime`, scrubs known CLSID markers across HKCU / HKLM / HKU, and related keys — without wiping your download list / InstallDefaults when those are separate.
-3. **Freeze** applies restrictive ACLs on tracking CLSID keys so IDM cannot rewrite trial timestamps.
+3. **Freeze** wipes the trial state, seeds missing CLSID tracker keys and applies deny-ACLs on all of them so IDM cannot persist trial timestamps.
 4. **Block updates** appends a managed section to `C:\Windows\System32\drivers\etc\hosts` and flushes DNS.
 5. **Backup/restore** snapshots registry exports and relevant AppData folders for rollback.
 
@@ -296,6 +296,16 @@ python -c "import ast; ast.parse(open('engine.py',encoding='utf-8').read()); ast
 ---
 
 ## Changelog
+
+### 5.2.0
+
+- **Fixed the recurring "IDM has not been registered for 30 days / Trial period is over" nag** — root cause: the trial clock is re-derived from the CLSID tracking copies, so a freeze that leaves any tracking key writable fails (observed live: a previous freeze left `{07999AC3-…}` absent, IDM rebuilt the clock inside it and expired anyway)
+- **Freeze** now follows the proven IAS flow: wipe DownloadManager state first, **seed missing tracker keys** (`{07999AC3-…}` + `{5ED60779-…}`), then lock every tracking key found — including IDM 6.43's *rotating* GUIDs caught by the dynamic scan
+- **Activate** rebuilt IAS-style: lock → register with a generated `XXXXX-XXXXX-XXXXX-XXXXX` serial (random identity defaults) → sinkhole update/activation domains → brief IDM seed → re-lock. Verified live: IDM 6.43b12 accepted the serial and switched `idmvers` from `Trial` to `Full`
+- Hosts blocking (16 domains) prevents the online serial revalidation that triggers the fake-serial nag and the update checks that re-flag machines
+- HKLM `Internet Download Manager` key fully recreated clean on reset (IAS parity)
+- Current-user `HKU\<SID>_Classes` mirrors are recognized as the same physical key as `HKCU\Software\Classes` (IAS 'HKCUsync') — no more duplicate targets / false lock failures
+- Status dashboard: nag-risk assessment, serial display, `radxcnt` day counter, locked-key detection
 
 ### 5.1.0
 

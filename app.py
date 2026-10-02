@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from engine import (
     APP_NAME, APP_ORG, VERSION, IDMEngine, ActionResult, IDMStatus,
-    is_admin, elevate_and_exit, app_store_dir,
+    is_admin, elevate_and_exit, app_store_dir, generate_serial,
 )
 
 
@@ -417,7 +417,7 @@ class ActivateDialog(QDialog):
     def __init__(self, fname: str, lname: str, email: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Activate — Registration Profile")
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(460)
         self.setModal(True)
 
         lay = QVBoxLayout(self)
@@ -427,19 +427,34 @@ class ActivateDialog(QDialog):
         head = QLabel("Registration profile")
         head.setStyleSheet("font-size:17px;font-weight:700;")
         lay.addWidget(head)
-        sub = QLabel("Written to IDM registry before freeze.")
+        sub = QLabel(
+            "IDM is registered with an IAS-format serial, the tracking keys are\n"
+            "ACL-locked, and update/activation servers are sinkholed — this is\n"
+            "what stops the recurring “trial period is over” nag."
+        )
         sub.setStyleSheet(f"color:{T.MUTED};font-size:12px;")
         lay.addWidget(sub)
 
         form = QFormLayout()
         form.setSpacing(10)
-        self.fname = QLineEdit(fname or "User")
-        self.lname = QLineEdit(lname or "")
-        self.email = QLineEdit(email or "user@email.local")
+        self.fname = QLineEdit(fname)
+        self.fname.setPlaceholderText("empty = random 4-digit (IAS style)")
+        self.lname = QLineEdit(lname)
+        self.lname.setPlaceholderText("empty = random 4-digit (IAS style)")
+        self.email = QLineEdit(email)
+        self.email.setPlaceholderText("empty = <first>.<last>@tonec.com")
+        self.serial = QLineEdit(generate_serial())
+        self.serial.setReadOnly(True)
+        self.serial.setStyleSheet(f"color:{T.GREEN};font-family:Consolas;")
         form.addRow("First name", self.fname)
         form.addRow("Last name", self.lname)
         form.addRow("Email", self.email)
+        form.addRow("Serial (auto)", self.serial)
         lay.addLayout(form)
+
+        self.chk_block = QCheckBox("Block IDM update / activation servers (recommended)")
+        self.chk_block.setChecked(True)
+        lay.addWidget(self.chk_block)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -452,11 +467,13 @@ class ActivateDialog(QDialog):
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
 
-    def values(self) -> Tuple[str, str, str]:
+    def values(self) -> Tuple[str, str, str, str, bool]:
         return (
             self.fname.text().strip(),
             self.lname.text().strip(),
             self.email.text().strip(),
+            self.serial.text().strip(),
+            self.chk_block.isChecked(),
         )
 
 
@@ -568,7 +585,8 @@ class MainWindow(QMainWindow):
         ),
         "freeze": (
             "Freeze Trial",
-            "Deny ACL write on CLSID keys so the trial clock cannot advance.",
+            "Wipe trial state, seed missing CLSID keys and ACL-lock ALL of them — "
+            "IDM can never persist its clock again (fixes the expiry nag).",
             T.ACCENT,
         ),
         "unfreeze": (
@@ -578,7 +596,8 @@ class MainWindow(QMainWindow):
         ),
         "activate": (
             "Activate",
-            "Reset → inject identity → seed CLSID → freeze in one pass.",
+            "Reset → lock CLSIDs → register with an IAS-format serial → block "
+            "phone-home servers → seed → re-lock. No nags, no expiry.",
             T.ORANGE,
         ),
         "block_updates": (
@@ -905,7 +924,8 @@ class MainWindow(QMainWindow):
         self.chk_auto = QCheckBox("Check IDM status on startup")
         self.chk_auto.setChecked(self.settings.value("ui/auto_check_status", True, type=bool))
 
-        self.set_fname = QLineEdit(self.settings.value("activate/fname", "User", type=str))
+        self.set_fname = QLineEdit(self.settings.value("activate/fname", "", type=str))
+        self.set_fname.setPlaceholderText("empty = random (IAS style)")
         self.set_lname = QLineEdit(self.settings.value("activate/lname", "", type=str))
         self.set_email = QLineEdit(self.settings.value("activate/email", "", type=str))
         self.set_days = QSpinBox()
@@ -1115,18 +1135,18 @@ class MainWindow(QMainWindow):
 
         if action == "activate" and "fname" not in kwargs:
             dlg = ActivateDialog(
-                self.settings.value("activate/fname", "User", type=str),
+                self.settings.value("activate/fname", "", type=str),
                 self.settings.value("activate/lname", "", type=str),
                 self.settings.value("activate/email", "", type=str),
                 self,
             )
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            fn, ln, em = dlg.values()
+            fn, ln, em, key, block = dlg.values()
             self.settings.setValue("activate/fname", fn)
             self.settings.setValue("activate/lname", ln)
             self.settings.setValue("activate/email", em)
-            kwargs.update(fname=fn, lname=ln, email=em)
+            kwargs.update(fname=fn, lname=ln, email=em, serial=key, block_updates=block)
 
         if self.settings.value("ui/confirm_destructive", True, type=bool) and action in self.DESTRUCTIVE:
             meta = self.ACTIONS.get(action, (action, "", T.TEXT))
@@ -1199,7 +1219,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("ui/minimize_to_tray", self.chk_tray.isChecked())
         self.settings.setValue("ui/confirm_destructive", self.chk_confirm.isChecked())
         self.settings.setValue("ui/auto_check_status", self.chk_auto.isChecked())
-        self.settings.setValue("activate/fname", self.set_fname.text().strip() or "User")
+        self.settings.setValue("activate/fname", self.set_fname.text().strip())
         self.settings.setValue("activate/lname", self.set_lname.text().strip())
         self.settings.setValue("activate/email", self.set_email.text().strip())
         self.settings.setValue("scheduler/days", self.set_days.value())
