@@ -1,12 +1,33 @@
 """IDM Trial Resetter Pro — core engine (IDM 6.42 / 6.43+).
 
-Calibrated against live registry on IDM 6.43.7.2 (v6.43b07 Trial):
-  HKCU\\Software\\DownloadManager values: tvfrdt, radxcnt, LastCheckQU, CheckUpdtVM, LstCheck
-  HKCU\\Software\\DownloadManager\\ConfigTime (subkey — installation clock)
-  HKCU\\Software\\Classes\\WOW6432Node\\CLSID\\{07999AC3-058B-40BF-984F-69EB1E554CA7}
-      Model, Therad
-  HKEY_USERS\\*_Classes\\WOW6432Node\\CLSID\\{07999AC3-...} and {5ED60779-...}
+Live-calibrated against an EXPIRED IDM 6.43.10 (v6.43b10 Trial) install.
+
+Trial-state storage found on disk:
+  HKCU\\Software\\DownloadManager values:
+      tvfrdt, radxcnt (day counter; 29 at expiry), scansk, CheckUpdtVM,
+      LastCheckQU (unix ts), LstCheck, LastCheck, MData, ptrk_scdt,
+      cDTvBFquXk0, bRmGUCfEx + vCOUFP (new 6.43.x obfuscated markers),
+      FName/LName/Email/Serial (registration identity)
+  HKCU\\Software\\DownloadManager\\ConfigTime      ((Default) = unix install clock)
+  HKCU\\Software\\DownloadManager\\SpecialData     (lgfgf.1/.2, lgasa.1/.2 blobs)
+  HKCU\\Software\\Classes\\[WOW6432Node\\]CLSID\\{07999AC3-058B-40BF-984F-69EB1E554CA7}
+      Model / Therad / MData
+  HKCU\\Software\\Classes\\WOW6432Node\\CLSID\\{5ED60779-4DE2-4E07-B862-974CA4FF2E9C}
+      ACL-locked with a deny-Everyone ACE (freeze artifact / anti-tamper):
+      invisible to plain KEY_READ existence checks and undeletable until the
+      resetter enables SeTakeOwnershipPrivilege, takes ownership and
+      REPLACES the whole DACL (dropping every deny ACE)
+  HKEY_USERS\\*_Classes mirrors of the CLSID keys
   HKLM\\SOFTWARE\\WOW6432Node\\Internet Download Manager\\AdvIntDriverEnabled2
+  %APPDATA%\\IDM\\idmupdt.exe  (downloaded self-updater payload)
+
+Anti-reset defenses handled (verified live):
+  * deny-Everyone ACLs on CLSID keys — see {5ED60779-…} above
+  * a watchdog thread inside IDMShellExt64.dll/IDMNetMon64.dll (loaded in
+    explorer.exe and other shell hosts) re-creates ConfigTime from a cached
+    copy ~1s after deletion. Verified harmless (IDM overwrites ConfigTime at
+    the next fresh start — a stale planted copy did NOT resurrect the old
+    trial day counter), and the resetter re-anchors it to NOW.
 """
 from __future__ import annotations
 
@@ -29,7 +50,7 @@ if os.name != "nt":
 
 import winreg
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 APP_NAME = "IDM Trial Resetter Pro"
 APP_ORG = "IDMTools"
 
@@ -38,9 +59,13 @@ DM_TRIAL_VALUES = [
     "tvfrdt", "radxcnt", "scansk", "CheckUpdtVM",
     "LastCheck", "LastCheckQU", "LstCheck", "MData",
     "ptrk_scdt", "cDTvBFquXk0", "auto_reset_trial",
+    # New obfuscated markers found live on IDM 6.43.10:
+    "bRmGUCfEx", "vCOUFP",
 ]
 
-DM_TRIAL_SUBKEYS = ["ConfigTime"]
+# ConfigTime  = installation clock ((Default) = unix timestamp)
+# SpecialData = obfuscated state blobs (lgfgf.1/.2, lgasa.1/.2) — 6.43.x
+DM_TRIAL_SUBKEYS = ["ConfigTime", "SpecialData"]
 
 IDM_CLSID_GUIDS = [
     "{07999AC3-058B-40BF-984F-69EB1E554CA7}",
@@ -69,7 +94,15 @@ IDM_PROCESSES = [
     "IDMan.exe", "IDMIntegrator.exe", "IDMIntegrator64.exe",
     "IEMonitor.exe", "idmupdate.exe", "IDMHelp.exe",
     "IDMNotification.exe", "IDMGrHlp.exe", "IDMMsgHost.exe",
+    "idmBroker.exe", "idmupdt.exe",
 ]
+
+# Downloaded self-updater payload found in %APPDATA%\IDM on 6.43.10 —
+# lets IDM silently update itself (changing the registry layout).
+APPDATA_TRIAL_FILES = ("idmupdt.exe",)
+
+# Subkeys identifying a real COM class — never treat those as IDM trackers.
+COM_PROTECTED_SUBKEYS = ("LocalServer32", "InProcServer32", "InProcHandler32")
 
 IDM_EXE_CANDIDATES = [
     r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
@@ -94,6 +127,19 @@ HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
 HOSTS_HEADER = "# --- IDM Block Start ---"
 HOSTS_FOOTER = "# --- IDM Block End ---"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+# Enable SeTakeOwnership / SeBackup / SeRestore (9, 17, 18) in the current
+# process token — required to open deny-ACL'd registry keys for WRITE_OWNER
+# and to replace their DACL (proven approach from IDM-Activation-Script).
+PS_PRIVILEGES = (
+    "$ab=[AppDomain]::CurrentDomain.DefineDynamicAssembly(4,1);"
+    "$mb=$ab.DefineDynamicModule(2,$false);"
+    "$tb=$mb.DefineType(0);"
+    "$tb.DefinePInvokeMethod('RtlAdjustPrivilege','ntdll.dll','Public, Static',"
+    "1,[int],@([int],[bool],[bool],[bool].MakeByRefType()),1,3)|Out-Null;"
+    "9,17,18|ForEach-Object{"
+    "$tb.CreateType()::RtlAdjustPrivilege($_,$true,$false,[ref]$false)|Out-Null};"
+)
 
 
 @dataclass
@@ -203,6 +249,46 @@ def reg_exists(root: int, subkey: str) -> bool:
             return True
     except OSError:
         return False
+
+
+def reg_state(root: int, subkey: str) -> str:
+    """Tri-state probe: 'present' | 'locked' | 'absent'.
+
+    'locked' (PermissionError, winerror 5) means the key EXISTS but denies
+    access — typically a deny-Everyone ACL left by a previous freeze or by
+    IDM's anti-tamper. Treating such keys as absent is the classic
+    silent-failure bug that lets IDM restore the trial clock from a hidden
+    CLSID copy, so locked keys must be collected as reset targets.
+    """
+    try:
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ):
+            return "present"
+    except FileNotFoundError:
+        return "absent"
+    except PermissionError:
+        return "locked"
+    except OSError:
+        return "absent"
+
+
+def probe_values(root: int, subkey: str) -> Tuple[List[str], bool]:
+    """(value names, locked?) — locked=True when the key denies read access."""
+    try:
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as k:
+            out: List[str] = []
+            i = 0
+            while True:
+                try:
+                    name, _, _ = winreg.EnumValue(k, i)
+                    out.append(name)
+                    i += 1
+                except OSError:
+                    break
+            return out, False
+    except PermissionError:
+        return [], True
+    except OSError:
+        return [], False
 
 
 def enum_keys(root: int, subkey: str) -> List[str]:
@@ -381,123 +467,155 @@ class IDMEngine:
             key = (root, full.lower())
             if key in seen:
                 return
-            if not reg_exists(root, full):
+            state = reg_state(root, full)
+            if state == "absent":
                 return
             seen.add(key)
             label = f"{hive_label(root)}\\...\\{full.split(chr(92))[-1][:28]}"
+            if state == "locked":
+                label += " [ACL-LOCKED]"
             if note:
                 label += f" ({note})"
             found.append((root, full, label))
             self.log(f"  · {label}")
 
+        try:
+            sids = enum_keys(winreg.HKEY_USERS, "")
+        except OSError:
+            sids = []
+
+        # 1. Known IDM GUIDs across every hive mirror (locked keys included).
         for guid in IDM_CLSID_GUIDS:
             for root, base in CLSID_BASES:
                 add(root, f"{base}\\{guid}", "known")
 
-        try:
-            for sid in enum_keys(winreg.HKEY_USERS, ""):
-                if not sid.endswith("_Classes"):
-                    continue
-                for sub in (rf"{sid}\CLSID", rf"{sid}\WOW6432Node\CLSID"):
-                    for guid in IDM_CLSID_GUIDS:
-                        add(winreg.HKEY_USERS, f"{sub}\\{guid}", "HKU")
-        except Exception as e:
-            self.log(f"  ! HKU known scan: {e}", "warning")
-
-        for root, base in CLSID_BASES:
-            if not reg_exists(root, base):
+        # 2. Per-user Classes mirrors of the known GUIDs.
+        for sid in sids:
+            if not sid.endswith("_Classes"):
                 continue
+            for sub in (rf"{sid}\CLSID", rf"{sid}\WOW6432Node\CLSID"):
+                for guid in IDM_CLSID_GUIDS:
+                    add(winreg.HKEY_USERS, f"{sub}\\{guid}", "HKU")
+
+        # 3. Dynamic discovery. IDM rotates GUIDs between builds, so scan the
+        #    user-writable CLSID hives for its signature content — marker
+        #    values, numeric/encoded default values, empty seed keys — while
+        #    skipping real COM classes. Unreadable (locked) keys are always
+        #    targets. Heuristics mirror IDM-Activation-Script, calibrated on
+        #    a live 6.43.10 install.
+        dynamic_bases = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Classes\CLSID"),
+            (winreg.HKEY_CURRENT_USER, r"Software\Classes\WOW6432Node\CLSID"),
+        ]
+        dynamic_bases += [
+            (winreg.HKEY_USERS, rf"{sid}\CLSID")
+            for sid in sids if sid.endswith("_Classes")
+        ]
+        dynamic_bases += [
+            (winreg.HKEY_USERS, rf"{sid}\WOW6432Node\CLSID")
+            for sid in sids if sid.endswith("_Classes")
+        ]
+        guid_re = re.compile(
+            r"^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}"
+            r"-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$"
+        )
+        for root, base in dynamic_bases:
             for guid in enum_keys(root, base):
-                if guid in IDM_CLSID_GUIDS:
+                if not guid_re.match(guid):
                     continue
                 full = f"{base}\\{guid}"
-                vals = enum_values(root, full)
+                if (root, full.lower()) in seen:
+                    continue
+                vals, locked = probe_values(root, full)
+                if locked:
+                    add(root, full, "locked")
+                    continue
                 if any(m in vals for m in CLSID_MARKERS):
                     add(root, full, "dynamic")
-
-        try:
-            for sid in enum_keys(winreg.HKEY_USERS, ""):
-                if not sid.endswith("_Classes"):
                     continue
-                for sub in (rf"{sid}\CLSID", rf"{sid}\WOW6432Node\CLSID"):
-                    if not reg_exists(winreg.HKEY_USERS, sub):
-                        continue
-                    for guid in enum_keys(winreg.HKEY_USERS, sub):
-                        if guid in IDM_CLSID_GUIDS:
-                            continue
-                        full = f"{sub}\\{guid}"
-                        vals = enum_values(winreg.HKEY_USERS, full)
-                        if any(m in vals for m in CLSID_MARKERS):
-                            add(winreg.HKEY_USERS, full, "HKU-dyn")
-        except Exception as e:
-            self.log(f"  ! HKU dynamic scan: {e}", "warning")
+                children = enum_keys(root, full)
+                if any(c in COM_PROTECTED_SUBKEYS for c in children):
+                    continue
+                dval = get_value(root, full, "")
+                dstr = str(dval[0]) if dval and dval[0] != "" else ""
+                if not vals and not children:
+                    add(root, full, "seed")
+                    continue
+                if dstr.isdigit() and not children:
+                    add(root, full, "numeric")
+                    continue
+                if ("+" in dstr or "=" in dstr) and not children:
+                    add(root, full, "encoded")
+                    continue
+                if children == ["Version"]:
+                    vdef = get_value(root, rf"{full}\Version", "")
+                    if vdef and str(vdef[0]).isdigit():
+                        add(root, full, "version")
 
         return found
 
-    def _force_take_ownership(self, root: int, full: str) -> None:
+    def _unlock_registry_key(self, root: int, full: str) -> bool:
+        """Break a deny-ACL lock on a registry key.
+
+        Enables ownership/backup/restore privileges in a PowerShell child,
+        takes ownership as BUILTIN\\Administrators, then REPLACES the whole
+        DACL with a single Everyone-FullControl rule (protected) — dropping
+        every inherited and explicit deny ACE so the key can be deleted.
+        """
         if root == winreg.HKEY_USERS:
-            ps = f"""
-$p = 'Registry::HKEY_USERS\\{full.replace("'", "''")}'
-try {{
-  $acl = Get-Acl $p
-  $admin = New-Object System.Security.Principal.NTAccount('BUILTIN','Administrators')
-  $acl.SetOwner($admin)
-  Set-Acl -Path $p -AclObject $acl
-  $acl = Get-Acl $p
-  $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-    'Everyone','FullControl','ContainerInherit,ObjectInherit','None','Allow')
-  $acl.SetAccessRule($rule)
-  $acl.SetAccessRuleProtection($false,$true)
-  Set-Acl -Path $p -AclObject $acl
-  'OK'
-}} catch {{ $_.Exception.Message }}
-"""
-            run_powershell(ps, timeout=20)
-            return
-        if root == winreg.HKEY_CURRENT_USER:
-            ps_root = "CurrentUser"
+            ps_root, path = "Users", full
+        elif root == winreg.HKEY_CURRENT_USER:
+            ps_root, path = "CurrentUser", full
         elif root == winreg.HKEY_LOCAL_MACHINE:
-            ps_root = "LocalMachine"
+            ps_root, path = "LocalMachine", full
         else:
-            return
-        path_esc = full.replace("'", "''")
+            return False
+        path = path.replace("'", "''")
         ps = f"""
-$path = '{path_esc}'
-$root = [Microsoft.Win32.Registry]::{ps_root}
+{PS_PRIVILEGES}
+$rootKey = [Microsoft.Win32.Registry]::{ps_root}
+$path = '{path}'
 try {{
-  $key = $root.OpenSubKey($path, 'ReadWriteSubTree', 'TakeOwnership')
+  $key = $rootKey.OpenSubKey($path, 'ReadWriteSubTree', 'TakeOwnership')
   if ($key) {{
     $acl = New-Object System.Security.AccessControl.RegistrySecurity
-    $admin = [System.Security.Principal.NTAccount]('BUILTIN\\Administrators')
-    $acl.SetOwner($admin)
+    $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
     $key.SetAccessControl($acl); $key.Close()
   }}
-  $key = $root.OpenSubKey($path, 'ReadWriteSubTree', 'ChangePermissions')
+  $key = $rootKey.OpenSubKey($path, 'ReadWriteSubTree', 'ChangePermissions')
   if ($key) {{
-    $acl = $key.GetAccessControl()
-    $acl.SetAccessRuleProtection($false, $true)
+    $acl = New-Object System.Security.AccessControl.RegistrySecurity
     $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-      'Everyone','FullControl','ContainerInherit,ObjectInherit','None','Allow')
+      [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+      'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+    $acl.SetAccessRuleProtection($true, $false)
     $acl.SetAccessRule($rule)
     $key.SetAccessControl($acl); $key.Close()
-  }}
-  'OK'
-}} catch {{ $_.Exception.Message }}
+    'UNLOCKED'
+  }} else {{ 'FAILED: open ChangePermissions' }}
+}} catch {{ 'FAILED: ' + $_.Exception.Message }}
 """
-        run_powershell(ps, timeout=20)
+        code, out, _err = run_powershell(ps, timeout=30)
+        ok = "UNLOCKED" in (out or "")
+        self.log(
+            f"  {'✓' if ok else '✗'} ACL unlock {'succeeded' if ok else 'failed'}: "
+            f"{hive_label(root)}\\...\\{full.split(chr(92))[-1][:28]}",
+            "success" if ok else "error",
+        )
+        return ok
 
     def reset_trial(self) -> ActionResult:
         t0 = datetime.datetime.now()
         details: List[str] = []
         self.log("═" * 54, "header")
-        self.log("  RESET TRIAL  —  full 30-day restoration", "header")
+        self.log("  RESET TRIAL  —  full 30-day restoration (IDM 6.43.x)", "header")
         self.log("═" * 54, "header")
         self.kill_idm()
         steps = 7
+        dm = r"Software\DownloadManager"
 
         self.progress(1, steps, "Cleaning DownloadManager trial values")
         self.log("\n[1/7] HKCU\\Software\\DownloadManager trial values …")
-        dm = r"Software\DownloadManager"
         n = 0
         for val in DM_TRIAL_VALUES:
             ok, msg = delete_value(winreg.HKEY_CURRENT_USER, dm, val)
@@ -507,24 +625,45 @@ try {{
         self.log(f"  → {n} value(s) removed")
         details.append(f"DM values: {n}")
 
-        self.progress(2, steps, "Removing ConfigTime")
-        self.log("\n[2/7] ConfigTime installation clock …")
-        ok, msg = delete_key_tree(winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime")
-        if ok:
-            self.log("  ✓ Deleted ConfigTime subkey", "success")
-            details.append("ConfigTime removed")
-        else:
-            self.log(f"  · ConfigTime: {msg}", "info")
+        self.progress(2, steps, "Removing ConfigTime / SpecialData")
+        self.log("\n[2/7] Installation-clock subkeys (ConfigTime, SpecialData) …")
+        start_ts = int(t0.timestamp())
+        for sub in DM_TRIAL_SUBKEYS:
+            ok, msg = delete_key_tree(winreg.HKEY_CURRENT_USER, rf"{dm}\{sub}")
+            if ok:
+                self.log(f"  ✓ Deleted {sub}", "success")
+                details.append(f"{sub} removed")
+            else:
+                self.log(f"  · {sub}: {msg}", "info")
+        # IDM 6.43.x ships a watchdog inside IDMShellExt64/IDMNetMon (loaded
+        # in explorer.exe and other shell hosts) that re-creates ConfigTime
+        # from a cached copy ~1s after deletion. Verified harmless — IDM
+        # itself overwrites ConfigTime at the next fresh start — but we
+        # re-anchor it to NOW so the machine is left exactly as a fresh
+        # IDM install would be.
+        time.sleep(1.5)
+        if reg_state(winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime") != "absent":
+            ok, msg = set_value(
+                winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime", "",
+                int(time.time()), winreg.REG_DWORD,
+            )
+            if ok:
+                self.log(
+                    "  · ConfigTime re-created by shell watchdog "
+                    "(IDMShellExt64) — re-anchored to now",
+                    "warning",
+                )
+            details.append("ConfigTime re-anchored")
 
         self.progress(3, steps, "Removing CLSID tracking keys")
-        self.log("\n[3/7] CLSID tracking keys …")
+        self.log("\n[3/7] CLSID tracking keys (ACL-locked keys are unlocked first) …")
         targets = self.collect_clsid_targets()
-        removed = 0
-        denied = 0
+        removed = unlocked = denied = 0
         for root, full, label in targets:
             ok, msg = delete_key_tree(root, full)
             if not ok and "DENIED" in msg.upper():
-                self._force_take_ownership(root, full)
+                unlocked += 1
+                self._unlock_registry_key(root, full)
                 ok, msg = delete_key_tree(root, full)
             if ok:
                 removed += 1
@@ -532,7 +671,12 @@ try {{
             elif "Not found" not in msg:
                 denied += 1
                 self.log(f"  ! {label}: {msg}", "warning")
-        self.log(f"  → {removed} key(s) removed" + (f", {denied} denied" if denied else ""))
+        summary = f"  → {removed} key(s) removed"
+        if unlocked:
+            summary += f", {unlocked} ACL-unlocked"
+        if denied:
+            summary += f", {denied} denied"
+        self.log(summary)
         details.append(f"CLSID removed: {removed}")
 
         self.progress(4, steps, "HKEY_USERS DownloadManager")
@@ -543,13 +687,14 @@ try {{
                 if sid.endswith("_Classes") or sid in ("S-1-5-18", "S-1-5-19", "S-1-5-20"):
                     continue
                 user_dm = rf"{sid}\Software\DownloadManager"
-                if not reg_exists(winreg.HKEY_USERS, user_dm):
+                if reg_state(winreg.HKEY_USERS, user_dm) != "present":
                     continue
                 for val in DM_TRIAL_VALUES:
                     ok, _ = delete_value(winreg.HKEY_USERS, user_dm, val)
                     if ok:
                         hku_n += 1
-                delete_key_tree(winreg.HKEY_USERS, rf"{user_dm}\ConfigTime")
+                for sub in DM_TRIAL_SUBKEYS:
+                    delete_key_tree(winreg.HKEY_USERS, rf"{user_dm}\{sub}")
         except Exception as e:
             self.log(f"  ! HKU DM: {e}", "warning")
         self.log(f"  → {hku_n} user value(s) cleaned")
@@ -580,10 +725,18 @@ try {{
         self.log("\n[6/7] AppData cache (preserving active downloads) …")
         ad = appdata_idm()
         if ad.exists():
-            skip_dirs = {"DwnlData", "Scheduler"}
+            skip_dirs = {"DwnlData", "Scheduler", "Grabber"}
             for child in list(ad.iterdir()):
                 if child.name in skip_dirs:
                     self.log(f"  · Preserved {child.name}/")
+                    continue
+                if child.name in APPDATA_TRIAL_FILES and child.is_file():
+                    try:
+                        child.unlink(missing_ok=True)
+                        self.log(f"  ✓ Removed {child.name} (self-updater payload)", "success")
+                        details.append("idmupdt removed")
+                    except Exception as e:
+                        self.log(f"  ! {child.name}: {e}", "warning")
                     continue
                 try:
                     if child.is_dir():
@@ -600,19 +753,44 @@ try {{
         self.progress(7, steps, "Verifying")
         self.log("\n[7/7] Verification …")
         remaining = []
-        for val in ("tvfrdt", "radxcnt", "LastCheckQU", "LstCheck"):
+        for val in ("tvfrdt", "radxcnt", "LastCheckQU", "LstCheck",
+                    "CheckUpdtVM", "bRmGUCfEx", "vCOUFP"):
             if get_value(winreg.HKEY_CURRENT_USER, dm, val) is not None:
                 remaining.append(val)
-        if reg_exists(winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime"):
-            remaining.append("ConfigTime")
-        if remaining:
-            self.log(f"  ! Still present: {', '.join(remaining)}", "warning")
-            details.append(f"leftover: {','.join(remaining)}")
-        else:
-            self.log("  ✓ Core trial markers cleared", "success")
-            details.append("markers clean")
+        if reg_state(winreg.HKEY_CURRENT_USER, rf"{dm}\SpecialData") != "absent":
+            remaining.append("SpecialData")
+        # ConfigTime only counts as leftover when it holds a STALE timestamp
+        # (older than this run). A fresh one — written by us or by IDM at the
+        # next start — is exactly what a clean install looks like.
+        ct = get_value(winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime", "")
+        if ct is not None:
+            try:
+                if int(ct[0]) < start_ts:
+                    remaining.append("ConfigTime(stale)")
+            except (TypeError, ValueError):
+                remaining.append("ConfigTime")
+        clsid_left = [
+            label for root, full, label in targets
+            if reg_state(root, full) != "absent"
+        ]
+        remaining.extend(clsid_left)
 
         ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
+        if remaining:
+            self.log(f"  ! Still present: {', '.join(remaining)}", "error")
+            details.append(f"leftover: {','.join(remaining)}")
+            self.log("\n" + "═" * 54, "header")
+            self.log("  ✗ RESET INCOMPLETE — restart IDM is NOT safe yet", "error")
+            self.log("═" * 54, "header")
+            return ActionResult(
+                "reset", False, total=removed + n,
+                details=details,
+                error=f"Leftover trial state: {', '.join(remaining[:6])}",
+                duration_ms=ms,
+            )
+        self.log("  ✓ Core trial markers cleared", "success")
+        self.log("  ✓ All CLSID tracking keys removed", "success")
+        details.append("markers clean")
         self.log("\n" + "═" * 54, "header")
         self.log("  ✓ TRIAL RESET COMPLETE — restart IDM for a fresh 30 days", "success")
         self.log("═" * 54, "header")
@@ -655,28 +833,29 @@ try {{
   $key = $rootKey.OpenSubKey($path, 'ReadWriteSubTree', 'TakeOwnership')
   if ($null -eq $key) {{ Write-Output 'FAILED: {safe} open'; continue }}
   $acl = New-Object System.Security.AccessControl.RegistrySecurity
-  $acl.SetOwner([System.Security.Principal.NTAccount]('BUILTIN\\Administrators'))
+  $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
   $key.SetAccessControl($acl); $key.Close()
 
   $key = $rootKey.OpenSubKey($path, 'ReadWriteSubTree', 'ChangePermissions')
   if ($null -eq $key) {{ Write-Output 'FAILED: {safe} perms'; continue }}
   $acl = $key.GetAccessControl()
   $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-    'Everyone','FullControl','ContainerInherit,ObjectInherit','None','Deny')
+    [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+    'FullControl','ContainerInherit,ObjectInherit','None','Deny')
   $acl.ResetAccessRule($rule)
   $key.SetAccessControl($acl); $key.Close()
 
   $key = $rootKey.OpenSubKey($path, 'ReadWriteSubTree', 'TakeOwnership')
   if ($key) {{
     $acl = New-Object System.Security.AccessControl.RegistrySecurity
-    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-0-0')))
+    $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-0-0'))
     $key.SetAccessControl($acl); $key.Close()
   }}
   Write-Output 'FROZEN: {safe}'
 }} catch {{ Write-Output ("FAILED: {safe} - " + $_.Exception.Message) }}
 """)
 
-        _, stdout, stderr = run_powershell("\n".join(blocks), timeout=120)
+        _, stdout, stderr = run_powershell(PS_PRIVILEGES + "\n" + "\n".join(blocks), timeout=120)
         frozen = failed = 0
         for line in (stdout or "").splitlines():
             line = line.strip()
@@ -707,11 +886,12 @@ try {{
 try {{
   $p = 'Registry::HKEY_USERS\\{path}'
   $acl = Get-Acl $p
-  $acl.SetOwner([System.Security.Principal.NTAccount]('BUILTIN\\Administrators'))
+  $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
   Set-Acl -Path $p -AclObject $acl
   $acl = Get-Acl $p
   $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-    'Everyone','FullControl','ContainerInherit,ObjectInherit','None','Deny')
+    [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+    'FullControl','ContainerInherit,ObjectInherit','None','Deny')
   $acl.ResetAccessRule($rule)
   Set-Acl -Path $p -AclObject $acl
   Write-Output 'FROZEN: {safe}'
@@ -753,13 +933,14 @@ try {{
 try {{
   $p = 'Registry::HKEY_USERS\\{path}'
   $acl = Get-Acl $p -ErrorAction Stop
-  $acl.SetOwner([System.Security.Principal.NTAccount]('BUILTIN\\Administrators'))
+  $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
   $acl.SetAccessRuleProtection($false, $true)
   foreach ($ace in @($acl.GetAccessRules($true,$true,[System.Security.Principal.NTAccount]))) {{
     if ($ace.AccessControlType -eq 'Deny') {{ $acl.RemoveAccessRule($ace) | Out-Null }}
   }}
   $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-    'Everyone','FullControl','ContainerInherit,ObjectInherit','None','Allow')
+    [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+    'FullControl','ContainerInherit,ObjectInherit','None','Allow')
   $acl.SetAccessRule($rule)
   Set-Acl -Path $p -AclObject $acl
   Write-Output 'UNFROZEN'
@@ -775,7 +956,7 @@ try {{
   $key = $root.OpenSubKey($path, 'ReadWriteSubTree', 'TakeOwnership')
   if ($key) {{
     $acl = New-Object System.Security.AccessControl.RegistrySecurity
-    $acl.SetOwner([System.Security.Principal.NTAccount]('BUILTIN\\Administrators'))
+    $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
     $key.SetAccessControl($acl); $key.Close()
   }}
   $key = $root.OpenSubKey($path, 'ReadWriteSubTree', 'ChangePermissions')
@@ -786,14 +967,18 @@ try {{
       if ($ace.AccessControlType -eq 'Deny') {{ $acl.RemoveAccessRule($ace) | Out-Null }}
     }}
     $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-      'Everyone','FullControl','ContainerInherit,ObjectInherit','None','Allow')
+      [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
+      'FullControl','ContainerInherit,ObjectInherit','None','Allow')
     $acl.SetAccessRule($rule)
     $key.SetAccessControl($acl); $key.Close()
     Write-Output 'UNFROZEN'
   }} else {{ Write-Output 'SKIP' }}
 }} catch {{ Write-Output ("FAILED: {safe} - " + $_.Exception.Message) }}
 """)
-        _, stdout, _ = run_powershell("\n".join(blocks) if blocks else "''", timeout=120)
+        _, stdout, _ = run_powershell(
+            PS_PRIVILEGES + "\n" + ("\n".join(blocks) if blocks else "''"),
+            timeout=120,
+        )
         unfrozen = sum(1 for l in (stdout or "").splitlines() if "UNFROZEN" in l)
         ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
         self.log(f"  ✓ Unfrozen {unfrozen} key(s)", "success" if unfrozen else "info")
@@ -1059,11 +1244,24 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
             st.details.append("Trial mode (no serial)")
 
         markers = []
-        for val in ("tvfrdt", "radxcnt", "LastCheckQU", "LstCheck", "CheckUpdtVM", "scansk", "MData"):
+        for val in ("tvfrdt", "radxcnt", "LastCheckQU", "LstCheck", "CheckUpdtVM",
+                    "scansk", "MData", "ptrk_scdt", "cDTvBFquXk0",
+                    "bRmGUCfEx", "vCOUFP"):
             if get_value(winreg.HKEY_CURRENT_USER, dm, val) is not None:
                 markers.append(val)
-        if reg_exists(winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime"):
-            markers.append("ConfigTime")
+        # ConfigTime is written by IDM itself on every fresh start, so its
+        # presence is normal mid-trial — report its age as a detail instead.
+        if reg_state(winreg.HKEY_CURRENT_USER, rf"{dm}\SpecialData") != "absent":
+            markers.append("SpecialData")
+        ct = get_value(winreg.HKEY_CURRENT_USER, rf"{dm}\ConfigTime", "")
+        if ct is not None:
+            try:
+                age = max(0, int(time.time()) - int(ct[0]))
+                st.details.append(
+                    f"Install clock ConfigTime: {age // 86400} day(s) old"
+                )
+            except (TypeError, ValueError):
+                pass
         st.trial_markers = markers
         st.trial_clean = len(markers) == 0
         if markers:
@@ -1071,15 +1269,37 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
         else:
             st.details.append("No trial tracking values")
 
+        radx = get_value(winreg.HKEY_CURRENT_USER, dm, "radxcnt")
+        if radx is not None:
+            try:
+                cnt = int(radx[0])
+                left = 30 - cnt
+                st.details.append(
+                    f"Trial counter radxcnt={cnt} "
+                    + ("(EXPIRED)" if left <= 0 else f"(~{left} day(s) left)")
+                )
+            except (TypeError, ValueError):
+                pass
+
         hits = []
+        locked_hits = 0
         for guid in IDM_CLSID_GUIDS:
             for root, base in CLSID_BASES[:2]:
-                full = f"{base}\\{guid}"
-                if reg_exists(root, full):
+                state = reg_state(root, f"{base}\\{guid}")
+                if state == "present":
                     hits.append(f"{hive_label(root)}:{guid[:9]}…")
+                elif state == "locked":
+                    hits.append(f"{hive_label(root)}:{guid[:9]}…[LOCKED]")
+                    locked_hits += 1
         st.clsid_hits = hits
         if hits:
             st.details.append(f"CLSID hits: {len(hits)}")
+        if locked_hits:
+            st.frozen = True
+            st.details.append(
+                f"{locked_hits} CLSID key(s) ACL-locked (deny ACE) — "
+                "reset/unfreeze will take ownership and clear it"
+            )
 
         freeze_probed = False
         guid0 = IDM_CLSID_GUIDS[0]

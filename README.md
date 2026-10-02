@@ -3,7 +3,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![UI](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
-![Version](https://img.shields.io/badge/version-5.0.0-blue)
+![Version](https://img.shields.io/badge/version-5.1.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 Professional Windows desktop tool to **inspect, reset, freeze, and manage the Internet Download Manager (IDM) trial state**. Dark Fusion UI, live registry calibration for IDM **6.42 / 6.43+**, one-file admin EXE build, backups, and optional trial auto-reset via Task Scheduler.
@@ -17,7 +17,7 @@ Professional Windows desktop tool to **inspect, reset, freeze, and manage the In
 | Feature | Description |
 |--------|-------------|
 | **Live status dashboard** | Detects install path, version, trial vs registered, trial markers, CLSID hits, freeze / hosts / auto-reset state |
-| **Trial reset** | Clears DownloadManager trial values, `ConfigTime`, CLSID markers, related HKU / HKLM keys |
+| **Trial reset** | Clears DownloadManager trial values, `ConfigTime` / `SpecialData`, CLSID markers (incl. ACL-locked keys), related HKU / HKLM keys |
 | **Freeze / Unfreeze** | ACL-locks or restores IDM tracking CLSID keys so the trial clock cannot advance |
 | **Activate pipeline** | Reset → inject registration identity → seed CLSID → freeze |
 | **Block / Unblock updates** | Sinkholes IDM update domains in the system `hosts` file + DNS flush |
@@ -26,11 +26,30 @@ Professional Windows desktop tool to **inspect, reset, freeze, and manage the In
 | **Professional UI** | Dashboard, Operations, Backup, History, Settings, Console, system tray |
 | **Admin EXE** | Single-file PyInstaller build with embedded `requireAdministrator` UAC manifest |
 
-Calibrated against live IDM **6.43.7.2** (`v6.43b07 Trial`), including:
+Calibrated against a live, **expired** IDM **6.43.10** (`v6.43b10 Trial`) install — every key below was verified on disk:
 
-- `HKCU\Software\DownloadManager` — `tvfrdt`, `radxcnt`, `LastCheckQU`, `LstCheck`, `CheckUpdtVM`, `ConfigTime`, …
-- `HKCU\Software\Classes\WOW6432Node\CLSID\{07999AC3-058B-40BF-984F-69EB1E554CA7}` (`Model`, `Therad`, …)
-- Additional known CLSID GUIDs and HKLM IDM paths
+**Trial clock / counters — `HKCU\Software\DownloadManager`:**
+
+| Item | Role |
+|------|------|
+| `tvfrdt`, `radxcnt` (29 = day 29 of 30), `scansk`, `CheckUpdtVM`, `LastCheckQU`, `LstCheck`, `LastCheck`, `MData`, `ptrk_scdt`, `cDTvBFquXk0` | trial clock, counters, update-check stamps, machine fingerprint |
+| `bRmGUCfEx`, `vCOUFP` | **new obfuscated markers added in 6.43.x** |
+| `FName`, `LName`, `Email`, `Serial` | registration identity |
+| `ConfigTime` subkey | installation clock (`(Default)` = unix timestamp) |
+| `SpecialData` subkey | **new 6.43.x state blobs** (`lgfgf.1/.2`, `lgasa.1/.2`) |
+
+**CLSID tracking copies — `HKCU\Software\Classes\[WOW6432Node\]CLSID\{GUID}` (+ `HKU\<SID>_Classes` mirrors):**
+
+- `{07999AC3-058B-40BF-984F-69EB1E554CA7}` — `Model`, `Therad`, `MData`
+- `{5ED60779-4DE2-4E07-B862-974CA4FF2E9C}` — frequently carries a **deny-Everyone ACL** (freeze artifact / anti-tamper). A plain `KEY_READ` existence check reports it *absent*, so naive resetters silently skip it and IDM restores the trial from this hidden copy. The resetter enables `SeTakeOwnershipPrivilege`, takes ownership and replaces the whole DACL before deleting it.
+- `{7B8E9164-…}`, `{6DDF00DB-…}`, `{D5B91409-…}` — legacy GUIDs, kept for older builds
+
+**Other:**
+
+- `HKLM\SOFTWARE\WOW6432Node\Internet Download Manager\AdvIntDriverEnabled2`
+- `%APPDATA%\IDM\idmupdt.exe` — downloaded self-updater payload (removed during reset)
+- **ConfigTime watchdog** — IDM 6.43.x's `IDMShellExt64.dll`/`IDMNetMon64.dll` (loaded inside `explorer.exe` and other shell hosts) re-creates `ConfigTime` from a cached copy ~1s after deletion. Verified harmless: with a planted stale `ConfigTime`, IDM still starts a fresh trial (`radxcnt = 1`) and rewrites the clock itself. The resetter detects the restore and re-anchors `ConfigTime` to *now* — the exact state of a fresh install
+- Dynamic CLSID discovery heuristics (marker values, numeric/encoded defaults, empty seed keys) so future GUID rotations are still caught
 
 ---
 
@@ -277,6 +296,17 @@ python -c "import ast; ast.parse(open('engine.py',encoding='utf-8').read()); ast
 ---
 
 ## Changelog
+
+### 5.1.0
+
+- **Fixed the core reset bug on latest IDM**: CLSID keys locked with deny-Everyone ACLs (e.g. `{5ED60779-…}`) were invisible to the old existence check and silently skipped — the resetter now detects them via a tri-state probe (`present` / `locked` / `absent`), enables `SeTakeOwnershipPrivilege` / `SeBackupPrivilege` / `SeRestorePrivilege`, takes ownership and **replaces the whole DACL** (dropping every deny ACE) before deleting
+- Added IDM 6.43.x trial markers found live on an expired 6.43.10 install: `bRmGUCfEx`, `vCOUFP`, `SpecialData` subkey (`lgfgf.1/.2`, `lgasa.1/.2` obfuscated blobs)
+- Reset now removes `%APPDATA%\IDM\idmupdt.exe` (downloaded self-updater payload)
+- Reset verification now includes CLSID targets and reports honest success/failure (no more "COMPLETE" while a locked key survived)
+- Dynamic CLSID discovery heuristics (numeric/encoded default values, empty seed keys, `\Version` pattern, locked keys) with real-COM-class exclusion — survives future GUID rotation
+- Kill list extended with `idmBroker.exe` / `idmupdt.exe`; site Grabber projects preserved during AppData cleanup
+- `check_status` reports the `radxcnt` day counter (e.g. `radxcnt=29 (EXPIRED)`) and flags ACL-locked CLSID keys
+- Locale-safe ACL operations via well-known SIDs (`S-1-5-32-544`, `S-1-1-0`) instead of localized `BUILTIN\Administrators` / `Everyone` names
 
 ### 5.0.0
 

@@ -531,11 +531,11 @@ class AboutDialog(QDialog):
         body = QLabel(
             "Professional local toolkit for Internet Download Manager trial "
             "management on systems you own.\n\n"
-            "Calibrated for IDM 6.43+ registry layout:\n"
-            "• DownloadManager trial values + ConfigTime clock\n"
-            "• WOW6432Node CLSID markers (Model / Therad)\n"
-            "• HKEY_USERS Classes CLSID cleanup\n"
-            "• Hosts update blocking, backup, freeze ACLs"
+            "Calibrated for IDM 6.43.x registry layout (verified live on 6.43.10):\n"
+            "• DownloadManager trial values + ConfigTime clock + SpecialData blobs\n"
+            "• WOW6432Node CLSID markers (Model / Therad / MData)\n"
+            "• ACL-locked CLSID keys: ownership takeover + DACL replacement\n"
+            "• HKEY_USERS Classes CLSID cleanup, hosts blocking, freeze ACLs"
         )
         body.setWordWrap(True)
         body.setStyleSheet(f"color:{T.TEXT};font-size:13px;")
@@ -562,7 +562,8 @@ class MainWindow(QMainWindow):
     ACTIONS = {
         "reset": (
             "Reset Trial",
-            "Deep-clean trial markers across DownloadManager, ConfigTime, CLSID hives.",
+            "Deep-clean trial markers (tvfrdt, radxcnt, ConfigTime, SpecialData, "
+            "bRmGUCfEx, vCOUFP) and CLSID keys — including ACL-locked ones.",
             T.GREEN,
         ),
         "freeze": (
