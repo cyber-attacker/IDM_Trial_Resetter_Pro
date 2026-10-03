@@ -59,7 +59,7 @@ if os.name != "nt":
 
 import winreg
 
-VERSION = "5.3.0"
+VERSION = "5.3.1"
 APP_NAME = "IDM Trial Resetter Pro"
 APP_ORG = "IDMTools"
 
@@ -141,9 +141,27 @@ IDM_BLOCK_DOMAINS = [
     "support.internetdownloadmanager.com",
 ]
 
+# Tonec / IDM server IPs observed live (Oct 2026). Used as a static fallback
+# when DNS resolution is unavailable, and always merged into the firewall
+# phone-home block. All IDM update / validation domains resolve to these.
+IDM_SERVER_IPS = [
+    "67.18.60.145",    # registeridm.com / internetdownloadmanager.com
+    "67.18.140.140",   # secure.registeridm.com / dl / update subdomains
+    "169.62.35.21",    # tonec.com / www.tonec.com
+    "159.69.68.58",    # mirror.internetdownloadmanager.com
+]
+
+FW_RULE_NAME = "IDM Trial Resetter Pro - Phone-home Block"
+
 HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
 HOSTS_HEADER = "# --- IDM Block Start ---"
 HOSTS_FOOTER = "# --- IDM Block End ---"
+# hosts pin is trustworthy only when every one of these is actively mapped.
+HOSTS_CRITICAL_DOMAINS = (
+    "registeridm.com", "www.registeridm.com", "secure.registeridm.com",
+    "tonec.com", "www.tonec.com",
+    "internetdownloadmanager.com", "www.internetdownloadmanager.com",
+)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 # Enable SeTakeOwnership / SeBackup / SeRestore (9, 17, 18) in the current
@@ -1359,10 +1377,93 @@ try {{
             return v[0]
         return None
 
+    def _resolve_tonec_ips(self) -> List[str]:
+        """Resolve the Tonec/IDM domains via an EXTERNAL DNS server (bypasses
+        the local hosts pin) and merge with the static fallback list."""
+        domain_list = "','".join(IDM_BLOCK_DOMAINS)
+        ps = f"""
+$domains = @('{domain_list}')
+$ips = @()
+foreach ($d in $domains) {{
+  foreach ($srv in @('8.8.8.8','1.1.1.1')) {{
+    try {{
+      $r = Resolve-DnsName -Name $d -Server $srv -ErrorAction Stop
+      $ips += ($r | Where-Object {{$_.IPAddress}} | Select-Object -ExpandProperty IPAddress)
+      break
+    }} catch {{ }}
+  }}
+}}
+($ips | Sort-Object -Unique | Where-Object {{
+  $_ -match '^[0-9.]+$' -and $_ -ne '127.0.0.1' -and $_ -ne '0.0.0.0'
+}}) -join ','
+"""
+        _, out, _ = run_powershell(ps, timeout=60)
+        ips = set(IDM_SERVER_IPS)
+        for ip in (out or "").replace("\r", "").split(","):
+            ip = ip.strip()
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and ip not in ("127.0.0.1", "0.0.0.0"):
+                ips.add(ip)
+        return sorted(ips)
+
+    def _harden_hosts_acl(self) -> bool:
+        """Protect the hosts file: protected DACL — only SYSTEM and
+        Administrators keep write access, everyone else read-only. Observed
+        live: an elevated IDM component commented out our block entries to
+        reach registeridm.com. This raises the bar for repeat tampering."""
+        path_esc = str(HOSTS_PATH).replace("'", "''")
+        ps = f"""
+$path = '{path_esc}'
+try {{
+  $acl = Get-Acl -LiteralPath $path
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($pair in @(
+    @('S-1-5-18','FullControl'),
+    @('S-1-5-32-544','FullControl'),
+    @('S-1-1-0','ReadAndExecute')
+  )) {{
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+      [System.Security.Principal.SecurityIdentifier]::new($pair[0]),
+      $pair[1], 'Allow')
+    $acl.SetAccessRule($rule)
+  }}
+  Set-Acl -LiteralPath $path -aclObject $acl
+  'HARDENED'
+}} catch {{ 'FAILED: ' + $_.Exception.Message }}
+"""
+        _, out, _ = run_powershell(ps, timeout=30)
+        return "HARDENED" in (out or "")
+
+    def _restore_hosts_acl(self) -> bool:
+        """Re-enable inherited ACL on hosts (undo _harden_hosts_acl)."""
+        path_esc = str(HOSTS_PATH).replace("'", "''")
+        ps = f"""
+$path = '{path_esc}'
+try {{
+  $acl = Get-Acl -LiteralPath $path
+  $acl.SetAccessRuleProtection($false, $true)
+  Set-Acl -LiteralPath $path -aclObject $acl
+  'RESTORED'
+}} catch {{ 'FAILED: ' + $_.Exception.Message }}
+"""
+        _, out, _ = run_powershell(ps, timeout=30)
+        return "RESTORED" in (out or "")
+
+    def _firewall_block_state(self) -> bool:
+        code, out, _ = _run(
+            ["netsh", "advfirewall", "firewall", "show", "rule",
+             f"name={FW_RULE_NAME}"],
+            timeout=10,
+        )
+        return code == 0 and "No rules match" not in (out or "")
+
     def block_updates(self) -> ActionResult:
+        """Sinkhole the update/activation domains — tamper-healing, IPv6
+        aware, ACL-hardened, plus a Windows Firewall backstop that blocks
+        IDMan.exe from reaching the Tonec server IPs directly (hosts editing
+        cannot bypass the firewall)."""
         t0 = datetime.datetime.now()
         self.log("═" * 54, "header")
-        self.log("  BLOCK UPDATES  —  hosts sinkhole", "header")
+        self.log("  BLOCK UPDATES  —  hosts sinkhole + firewall backstop", "header")
         self.log("═" * 54, "header")
         if not HOSTS_PATH.exists():
             return ActionResult("block_updates", False, error="hosts file missing")
@@ -1370,30 +1471,84 @@ try {{
             content = HOSTS_PATH.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             return ActionResult("block_updates", False, error=str(e))
-        if HOSTS_HEADER in content:
-            self.log("  · Already blocked", "info")
-            return ActionResult("block_updates", True, details=["Already blocked"])
 
-        lines = ["", HOSTS_HEADER, "# Block IDM update / activation servers"]
-        added = 0
+        tampered = any(
+            line.strip().startswith("#") and any(pin in line for pin in ("127.0.0.1 ", "0.0.0.0 ", "::1 "))
+            for line in content.splitlines()
+            if any(d in line for d in IDM_BLOCK_DOMAINS)
+        )
+        if tampered:
+            self.log(
+                "  ! Existing block was TAMPERED (entries commented out by IDM) "
+                "— healing it",
+                "warning",
+            )
+
+        # Resolve server IPs BEFORE pinning the domains in hosts.
+        self.log("\n[1/4] Resolving Tonec / IDM server IPs via external DNS …")
+        ips = self._resolve_tonec_ips()
+        self.log(f"  → {len(ips)} server IP(s): {', '.join(ips)}", "success")
+
+        # Strip any previous managed section (heals tampered / outdated blocks)
+        self.log("[2/4] Writing hosts sinkhole (IPv4 + IPv6, healed) …")
+        pat = re.compile(re.escape(HOSTS_HEADER) + r".*?" + re.escape(HOSTS_FOOTER), re.DOTALL)
+        content = pat.sub("", content).rstrip("\n") + "\n"
+        lines = ["", HOSTS_HEADER,
+                 "# Block IDM update / activation servers (managed by IDM Trial Resetter Pro)",
+                 "# Firewall rule '" + FW_RULE_NAME + "' backs this up — editing hosts is not enough"]
         for d in IDM_BLOCK_DOMAINS:
             lines.append(f"127.0.0.1 {d}")
             lines.append(f"0.0.0.0 {d}")
-            added += 1
+            lines.append(f"::1 {d}")
         lines += [HOSTS_FOOTER, ""]
         try:
-            HOSTS_PATH.write_text(content.rstrip("\n") + "\n" + "\n".join(lines), encoding="utf-8")
-            self.log(f"  ✓ Blocked {added} domain(s)", "success")
-            _run(["ipconfig", "/flushdns"], timeout=10)
-            self.log("  ✓ DNS cache flushed", "success")
+            HOSTS_PATH.write_text(content + "\n".join(lines), encoding="utf-8")
         except PermissionError:
             return ActionResult("block_updates", False, error="Access denied — run as Administrator")
         except Exception as e:
             return ActionResult("block_updates", False, error=str(e))
+        self.log(f"  ✓ Sinkholed {len(IDM_BLOCK_DOMAINS)} domains (127.0.0.1 / 0.0.0.0 / ::1)", "success")
+        _run(["ipconfig", "/flushdns"], timeout=10)
+        self.log("  ✓ DNS cache flushed", "success")
+
+        self.log("[3/4] Hardening hosts ACL (SYSTEM/Admins write, others read-only) …")
+        if self._harden_hosts_acl():
+            self.log("  ✓ Hosts ACL hardened", "success")
+        else:
+            self.log("  ! Could not harden hosts ACL", "warning")
+
+        self.log("[4/4] Adding firewall phone-home backstop …")
+        _run(["netsh", "advfirewall", "firewall", "delete", "rule",
+              f"name={FW_RULE_NAME}"], timeout=10)
+        # System-wide remote-IP block: observed live that IDM (running
+        # elevated) comments out hosts pins at every start, so hosts alone
+        # can't stop it. A firewall rule on the dedicated Tonec server IPs
+        # cannot be bypassed by any userland process, and the collateral is
+        # near zero (those IPs only host Tonec / IDM services).
+        cmd = ["netsh", "advfirewall", "firewall", "add", "rule",
+               f"name={FW_RULE_NAME}", "dir=out", "action=block", "enable=yes",
+               "profile=any", f"remoteip={','.join(ips)}"]
+        code, out, err = _run(cmd, timeout=15)
+        if code == 0:
+            self.log(
+                f"  ✓ Firewall rule added — Tonec server IPs ({', '.join(ips)}) "
+                "unreachable system-wide",
+                "success",
+            )
+        else:
+            self.log(
+                f"  ✗ Firewall rule failed: {(err or out or '').strip()[:160]}",
+                "error",
+            )
+
         ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
-        return ActionResult("block_updates", True, total=added, details=[f"{added} domains blocked"], duration_ms=ms)
+        details = [f"{len(IDM_BLOCK_DOMAINS)} domains sinkholed"]
+        if self._firewall_block_state():
+            details.append(f"firewall: {len(ips)} IP(s)")
+        return ActionResult("block_updates", True, total=len(IDM_BLOCK_DOMAINS), details=details, duration_ms=ms)
 
     def unblock_updates(self) -> ActionResult:
+        """Remove the hosts section, firewall rule and ACL hardening."""
         t0 = datetime.datetime.now()
         self.log("═" * 54, "header")
         self.log("  UNBLOCK UPDATES", "header")
@@ -1404,17 +1559,22 @@ try {{
             content = HOSTS_PATH.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             return ActionResult("unblock_updates", False, error=str(e))
-        if HOSTS_HEADER not in content:
+        if HOSTS_HEADER in content:
+            pat = re.compile(re.escape(HOSTS_HEADER) + r".*?" + re.escape(HOSTS_FOOTER), re.DOTALL)
+            new = re.sub(r"\n{3,}", "\n\n", pat.sub("", content).strip()) + "\n"
+            try:
+                HOSTS_PATH.write_text(new, encoding="utf-8")
+                self.log("  ✓ Removed block section", "success")
+                _run(["ipconfig", "/flushdns"], timeout=10)
+            except Exception as e:
+                return ActionResult("unblock_updates", False, error=str(e))
+        else:
             self.log("  · No block section present", "info")
-            return ActionResult("unblock_updates", True, details=["Not blocked"])
-        pat = re.compile(re.escape(HOSTS_HEADER) + r".*?" + re.escape(HOSTS_FOOTER), re.DOTALL)
-        new = re.sub(r"\n{3,}", "\n\n", pat.sub("", content).strip()) + "\n"
-        try:
-            HOSTS_PATH.write_text(new, encoding="utf-8")
-            self.log("  ✓ Removed block section", "success")
-            _run(["ipconfig", "/flushdns"], timeout=10)
-        except Exception as e:
-            return ActionResult("unblock_updates", False, error=str(e))
+        self._restore_hosts_acl()
+        code, _, _ = _run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                           f"name={FW_RULE_NAME}"], timeout=10)
+        self.log("  ✓ Firewall rule removed" if code == 0 else "  · No firewall rule",
+                 "success" if code == 0 else "info")
         ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
         return ActionResult("unblock_updates", True, details=["Block removed"], duration_ms=ms)
 
@@ -1624,13 +1784,56 @@ if ((Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue).State -
                 "reset/unfreeze will take ownership and clear it"
             )
 
+        # ── Phone-home protection: firewall rule is authoritative; hosts pins
+        # are a fast first layer (IDM comments them out when it runs
+        # elevated — observed live — but cannot bypass the firewall).
+        fw_active = self._firewall_block_state()
+        hosts_ok = False
         if HOSTS_PATH.exists():
             try:
-                if HOSTS_HEADER in HOSTS_PATH.read_text(encoding="utf-8", errors="replace"):
-                    st.updates_blocked = True
-                    st.details.append("Hosts sinkhole active")
+                content = HOSTS_PATH.read_text(encoding="utf-8", errors="replace")
+                if HOSTS_HEADER in content:
+                    active: set = set()
+                    commented: set = set()
+                    for line in content.splitlines():
+                        s = line.strip()
+                        if not s:
+                            continue
+                        if s.startswith("#") and ("IDM Block" in s or "managed by" in s):
+                            continue
+                        for d in IDM_BLOCK_DOMAINS:
+                            if s in (f"127.0.0.1 {d}", f"0.0.0.0 {d}", f"::1 {d}"):
+                                active.add(d)
+                            elif s.startswith("#") and s in (
+                                f"#127.0.0.1 {d}", f"#0.0.0.0 {d}", f"#{d}",
+                            ):
+                                commented.add(d)
+                    hosts_ok = not commented and all(
+                        d in active for d in HOSTS_CRITICAL_DOMAINS
+                    )
+                    if hosts_ok:
+                        st.details.append("Hosts sinkhole active (IPv4 + IPv6)")
+                    elif commented:
+                        st.details.append(
+                            f"Hosts pins tampered by IDM ({len(commented)} "
+                            "commented out)"
+                            + (
+                                " — harmless while the firewall backstop is active"
+                                if fw_active else " — re-run Block Updates"
+                            )
+                        )
+                    elif active:
+                        st.details.append(
+                            "Hosts block present but incomplete — re-run Block Updates"
+                        )
+                elif not fw_active:
+                    st.details.append("No hosts block section")
             except Exception:
                 pass
+        if fw_active:
+            st.details.append("Firewall phone-home block active (Tonec IPs unreachable)")
+        if fw_active or hosts_ok:
+            st.updates_blocked = True
 
         # Nag-risk assessment — explains the recurring "trial period is
         # over" popup and what stops it.

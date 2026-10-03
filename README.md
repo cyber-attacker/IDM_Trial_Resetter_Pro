@@ -22,7 +22,7 @@ Professional Windows desktop tool to **inspect, reset, freeze, and manage the In
 | **Freeze / Unfreeze** | Wipes trial state, seeds missing CLSID keys and ACL-locks **all** tracking keys (incl. IDM's rotating GUIDs) so the trial clock can never be persisted — the fix for the recurring "trial period is over" nag |
 | **Activate pipeline** | Reset → seed → lock → register with an IAS-format serial → sinkhole update/activation servers → brief IDM start → re-lock. Verified: IDM switches itself to `Full` mode and stops nagging |
 | **Deactivate (5.3)** | One-click undo of Activate: removes the serial, unfreezes trackers, removes the hosts block, leaves a clean day-1 trial |
-| **Block / Unblock updates** | Sinkholes IDM update domains in the system `hosts` file + DNS flush |
+| **Block / Unblock updates** | Tamper-healing hosts sinkhole (IPv4 + IPv6, ACL-hardened) **plus a Windows Firewall backstop** that makes the Tonec server IPs unreachable system-wide — IDM cannot bypass it even though it comments out hosts entries at every start |
 | **Open IDM + diagnostics report (5.3)** | Launch IDMan.exe from the dashboard; export a shareable status report |
 | **Backup & restore** | Registry + AppData snapshots under `%AppData%\IDMTools\IDMTrialResetterPro` |
 | **Auto-reset** | Optional scheduled task for silent headless resets (`--auto-reset`) |
@@ -66,7 +66,8 @@ Calibrated against a live, **expired** IDM **6.43.10** (`v6.43b10 Trial`) instal
 | Don't want to register, just never expire | **Freeze** | Wipes state and ACL-locks every tracker key. Trial stays day-1 forever |
 | Want a plain, honest 30-day trial | **Reset Trial** | Deep-clean only — no serial, no locks. Trial counts down again and expires in ~30 days |
 | Want to undo Activate | **Deactivate** | Removes serial + locks + hosts block → clean day-1 trial |
-| Registered but nag returned | **Block Updates** (+ check Freeze) | Stops serial revalidation (fake-serial nag) and silent self-updates |
+| Registered but nag returned | **Activate** again (Block Updates now also installs a firewall backstop that IDM cannot tamper with) |
+| Fake-serial nag ("registered with a fake Serial Number") | IDM reached its validation server and flagged the serial. Re-run **Activate** — the firewall rule keeps `registeridm.com` / Tonec servers unreachable, so the verdict cannot come back |
 
 The dashboard health banner makes this decision for you and shows a **Fix now** button for the recommended action.
 
@@ -309,6 +310,8 @@ python -c "import ast; ast.parse(open('engine.py',encoding='utf-8').read()); ast
 | Actions fail with Access denied | Run EXE / bat as Administrator |
 | Status shows not installed | Confirm `IDMan.exe` under Program Files (x86) or (x64) |
 | Freeze does nothing | Run reset/activate once so CLSID keys exist, then freeze |
+| Fake-serial nag after activation | Run Activate again — the firewall backstop stops IDM from validating the serial online |
+| IDM keeps editing the hosts file | Expected (it runs elevated); the firewall rule covers it — see Dashboard status |
 | Hosts block fails | Elevation required; ensure `hosts` is not read-only |
 | AV quarantines EXE | Add exclusion or run from source |
 | Old Python PATH conflict | Use `py -3 app.py` or full path to Python 3.10+ |
@@ -316,6 +319,14 @@ python -c "import ast; ast.parse(open('engine.py',encoding='utf-8').read()); ast
 ---
 
 ## Changelog
+
+### 5.3.1
+
+- **Fixed the fake-serial nag** ("IDM has been registered with a fake Serial Number…"). Live root-cause: an elevated IDM component **comments out the hosts block entries** (`#127.0.0.1 registeridm.com`, …) at every start to reach its validation server, which then flags the serial. Verified by `LastCheckQU` updating the moment a check succeeds
+- **Windows Firewall phone-home backstop**: Block Updates now also adds a system-wide outbound block on the resolved Tonec / IDM server IPs (dedicated servers — near-zero collateral). No userland process can bypass it, so serial revalidation and silent self-updates are impossible regardless of hosts tampering. The firewall rule is the authoritative protection signal in the status check
+- Hosts sinkhole upgraded: IPv6 (`::1`) pins, tamper-healing rewrite on every run, and a hardened protected DACL (SYSTEM/Admins write, everyone else read-only)
+- Status now reports hosts tampering honestly ("harmless while the firewall backstop is active") instead of crying wolf
+- Unblock Updates removes both the firewall rule and the ACL hardening
 
 ### 5.3.0
 
